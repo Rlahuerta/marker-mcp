@@ -131,7 +131,8 @@ Swap the commented lines to use the published `marker-pdf` package from PyPI ins
 | `MARKER_LLM_SERVICE` | *(auto)* | Override LLM service class explicitly |
 | `GOOGLE_API_KEY` | *(none)* | Gemini API key — auto-selects `GoogleGeminiService` |
 | `OLLAMA_BASE_URL` | *(none)* | Ollama URL — auto-selects `OllamaService` |
-| `OLLAMA_MODEL` | `llama3.2-vision` | Ollama model name |
+| `OLLAMA_MODEL` | `llama3.2-vision` | Ollama model name (use `gemma4:31b` for best quality) |
+| `OLLAMA_NO_CLOUD` | *(unset)* | Set to `1` to disable Ollama Cloud routing |
 | `OPENAI_API_KEY` | *(none)* | OpenAI key — auto-selects `OpenAIService` |
 | `OPENAI_BASE_URL` | `https://api.openai.com/v1` | OpenAI-compatible base URL |
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model name |
@@ -167,59 +168,110 @@ change the tool call. The service is auto-detected based on which key is present
 
 ### Ollama (local, privacy-first) — recommended for self-hosted use
 
-Ollama runs entirely on your machine — no data leaves your network.
+Ollama runs entirely on your machine — no data leaves your network. It also offers
+**Ollama Cloud** to offload inference to ollama.com servers when local hardware is limited.
 
-#### 1. Install Ollama and pull a vision model
+> **A vision/multimodal model is required.** Marker sends page images (base64) to the LLM
+> for table reconstruction, math, and form extraction. Text-only models will not work.
+
+#### Recommended models
+
+| Model | Size | VRAM (Q4) | Vision | Notes |
+|-------|------|-----------|--------|-------|
+| `gemma4:31b` | ~62 GB | ~16 GB | ✅ | **Best quality** — Google's latest multimodal, April 2025 |
+| `llama3.2-vision` | ~7 B | ~6 GB | ✅ | Default — good balance of speed and quality |
+| `llava` | ~7 B | ~6 GB | ✅ | Established alternative |
+| `minicpm-v` | ~4 B | ~4 GB | ✅ | Smallest option, fast on CPU |
+
+**Gemma4** (`gemma4:31b`) is Google DeepMind's newest generation model (released April 2025).
+It supports variable aspect ratios, configurable visual token budgets, and delivers
+significantly higher accuracy than llama3.2-vision — especially on complex tables, math,
+and multi-column layouts. It is fully API-compatible with Marker's `OllamaService` with
+no code changes required.
+
+VRAM requirements for `gemma4:31b` by quantization:
+
+| Quantization | VRAM | Typical GPU |
+|---|---|---|
+| FP16 | ~31 GB | A100, H100 |
+| Q8_0 | ~30 GB | A100 (40 GB) |
+| Q5_0 | ~18 GB | RTX 6000 Ada |
+| **Q4_0** | **~16 GB** | **RTX 4090 / 3090** ← recommended |
+| Q3_K_M | ~12 GB | RTX 3080 Ti |
+| Q2_K | ~8 GB | RTX 3070 |
+
+#### 1. Install Ollama
 
 ```bash
-# Install Ollama
 curl -fsSL https://ollama.com/install.sh | sh
-
-# Pull a multimodal vision model (required for PDF image understanding)
-ollama pull llama3.2-vision        # 7 B — good balance of speed and quality
-ollama pull llava                  # alternative
-ollama pull minicpm-v              # smaller, fast on CPU
 ```
 
-> **A vision model is required.** Text-only models (llama3, mistral, etc.) will
-> not work because Marker sends page images to the LLM.
-
-#### 2. Configure the server
-
-**Local (conda) — create a `.env` file:**
+#### 2. Pull a vision model
 
 ```bash
-# .env
+# High quality (needs ~16 GB VRAM with Q4 quantization)
+ollama pull gemma4:31b
+
+# Lighter option (~6 GB VRAM)
+ollama pull llama3.2-vision
+```
+
+#### 3a. Local Ollama (self-hosted)
+
+Create a `.env` file in the project root:
+
+```bash
+# .env — local Ollama with gemma4
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llama3.2-vision
+OLLAMA_MODEL=gemma4:31b
 ```
 
 Load it before starting the server:
 
 ```bash
 conda activate marker-mcp
-set -a && source .env && set +a
-marker_mcp --transport stdio
+bash start_mcp.sh          # sources .env automatically
+# or: set -a && source .env && set +a && marker_mcp --transport stdio
 ```
 
-Or use `start_mcp.sh` which sources `.env` automatically:
-
-```bash
-bash start_mcp.sh
-```
-
-**Docker — edit `docker-compose.yml` or pass env vars:**
+**Docker** — the container connects to the host Ollama instance:
 
 ```bash
 OLLAMA_BASE_URL=http://host.docker.internal:11434 \
-OLLAMA_MODEL=llama3.2-vision \
+OLLAMA_MODEL=gemma4:31b \
 docker compose up marker-mcp-gpu
 ```
 
-> `host.docker.internal` resolves to the host machine from inside Docker on Linux/macOS.
-> On Linux you may need `--add-host=host.docker.internal:host-gateway` in `docker-compose.yml`.
+> On Linux you may need to add `extra_hosts: ["host.docker.internal:host-gateway"]`
+> to the service in `docker-compose.yml`.
 
-#### 3. Use the tool
+#### 3b. Ollama Cloud (no local GPU required)
+
+Ollama Cloud routes inference to ollama.com servers — useful when local VRAM is
+insufficient to run `gemma4:31b`. Requires an [ollama.com](https://ollama.com) account.
+
+```bash
+# Sign in once
+ollama signin
+
+# Cloud model names have a -cloud suffix
+ollama pull gemma4:31b-cloud     # routes to ollama.com
+```
+
+Configure the server to use the cloud model:
+
+```bash
+# .env — Ollama Cloud
+OLLAMA_BASE_URL=http://localhost:11434   # still routes through local Ollama daemon
+OLLAMA_MODEL=gemma4:31b-cloud
+```
+
+> **Privacy note:** With Ollama Cloud, document content is sent to ollama.com servers.
+> Use local Ollama when working with sensitive documents.
+>
+> To disable cloud routing entirely: `export OLLAMA_NO_CLOUD=1`
+
+#### 4. Use the tool
 
 ```
 convert_document(filepath="/path/to/document.pdf", use_llm=True)
