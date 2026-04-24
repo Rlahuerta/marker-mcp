@@ -22,6 +22,13 @@ marker_mcp = "marker_mcp.mcp_server:mcp_server_cli"
 [tool.uv.sources]
 marker-pdf = { path = "../marker", editable = true }
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires real Marker models and an actual PDF file (deselect with '-m not integration')",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
