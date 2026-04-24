@@ -1,0 +1,29 @@
+[project]
+name = "marker-mcp"
+version = "0.1.0"
+description = "MCP server for the Marker document-to-markdown conversion library"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=2.0.0",
+    "marker-pdf[full]",
+    "click>=8.0.0",
+]
+
+[project.scripts]
+marker_mcp = "marker_mcp.mcp_server:mcp_server_cli"
+
+# ---------------------------------------------------------------------------
+# Local development: reference the sibling marker repo instead of PyPI.
+# Remove this section (or comment it out) to use the published PyPI release.
+# ---------------------------------------------------------------------------
+[tool.uv.sources]
+marker-pdf = { path = "../marker", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["marker_mcp"]

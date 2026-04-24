@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "marker-local-stdio": {
+      "command": "marker_mcp",
+      "args": ["--transport", "stdio"],
+      "description": "Local Marker MCP server via stdio (models load on first call)"
+    },
+    "marker-docker-sse": {
+      "url": "http://localhost:8000/sse",
+      "description": "Dockerised Marker MCP server via SSE"
+    }
+  }
+}

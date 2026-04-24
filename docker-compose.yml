@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+
+# Shared services section — referenced by both service profiles
+x-shared-volumes: &shared-volumes
+  - marker_models:/root/.cache
+  - ./uploads:/app/uploads
+
+x-shared-env: &shared-env
+  PYTHONUNBUFFERED: "1"
+  GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+  OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+
+services:
+  # -------------------------------------------------------------------------
+  # GPU service (default — no profile required)
+  # -------------------------------------------------------------------------
+  marker-mcp-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: marker-mcp:gpu
+    container_name: marker-mcp-gpu
+    ports:
+      - "${MARKER_MCP_PORT:-8000}:8000"
+    volumes: *shared-volumes
+    environment:
+      <<: *shared-env
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  # -------------------------------------------------------------------------
+  # CPU-only service (start with: docker compose --profile cpu-only up)
+  # -------------------------------------------------------------------------
+  marker-mcp-cpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        CUDA_VISIBLE_DEVICES: ""
+    image: marker-mcp:cpu
+    container_name: marker-mcp-cpu
+    profiles: [cpu-only]
+    ports:
+      - "${MARKER_MCP_PORT:-8000}:8000"
+    volumes: *shared-volumes
+    environment:
+      <<: *shared-env
+      CUDA_VISIBLE_DEVICES: ""
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/')"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+volumes:
+  marker_models:
+    name: marker_models
