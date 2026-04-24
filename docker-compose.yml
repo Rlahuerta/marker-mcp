@@ -7,8 +7,21 @@ x-shared-volumes: &shared-volumes
 
 x-shared-env: &shared-env
   PYTHONUNBUFFERED: "1"
+  # --- LLM service selection (leave blank to disable use_llm) ---
+  # Gemini (default when GOOGLE_API_KEY is set)
   GOOGLE_API_KEY: "${GOOGLE_API_KEY:-}"
+  # Ollama (local) — set OLLAMA_BASE_URL to auto-select OllamaService
+  OLLAMA_BASE_URL: "${OLLAMA_BASE_URL:-}"
+  OLLAMA_MODEL: "${OLLAMA_MODEL:-}"
+  # OpenAI / compatible — set OPENAI_API_KEY to auto-select OpenAIService
   OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+  OPENAI_BASE_URL: "${OPENAI_BASE_URL:-}"
+  OPENAI_MODEL: "${OPENAI_MODEL:-}"
+  # Claude — set CLAUDE_API_KEY to auto-select ClaudeService
+  CLAUDE_API_KEY: "${CLAUDE_API_KEY:-}"
+  CLAUDE_MODEL: "${CLAUDE_MODEL:-}"
+  # Override the service class explicitly (takes priority over all above)
+  MARKER_LLM_SERVICE: "${MARKER_LLM_SERVICE:-}"
 
 services:
   # -------------------------------------------------------------------------

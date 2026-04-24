@@ -2,6 +2,10 @@
 
 Models are initialised at module load time so that subsequent tool calls are fast.
 All blocking conversion calls are offloaded to a thread via asyncio.to_thread().
+
+LLM service selection is driven entirely by environment variables so that the
+MCP tool signatures stay simple (just use_llm=True) while the backend is
+fully configurable. See README.md § LLM-Enhanced Conversion for details.
 """
 
 import asyncio
@@ -15,6 +19,74 @@ from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict
 from marker.output import text_from_rendered
+
+# ---------------------------------------------------------------------------
+# LLM service configuration — resolved from environment variables.
+#
+# MARKER_LLM_SERVICE   import path of the service class (overrides all others)
+#
+# Ollama (local):
+#   OLLAMA_BASE_URL    base URL            (default: http://localhost:11434)
+#   OLLAMA_MODEL       vision model name   (default: llama3.2-vision)
+#
+# OpenAI / compatible:
+#   OPENAI_API_KEY     API key
+#   OPENAI_BASE_URL    base URL            (default: https://api.openai.com/v1)
+#   OPENAI_MODEL       model name          (default: gpt-4o-mini)
+#
+# Gemini (default when GOOGLE_API_KEY is set):
+#   GOOGLE_API_KEY     Gemini API key
+#
+# Claude:
+#   CLAUDE_API_KEY     API key
+#   CLAUDE_MODEL       model name          (default: claude-3-5-sonnet-20241022)
+# ---------------------------------------------------------------------------
+
+def _llm_options_from_env() -> dict:
+    """Build the LLM-related options dict from environment variables."""
+    opts: dict = {}
+
+    explicit_service = os.environ.get("MARKER_LLM_SERVICE")
+    if explicit_service:
+        opts["llm_service"] = explicit_service
+
+    # Ollama — detected by OLLAMA_BASE_URL or OLLAMA_MODEL being set
+    ollama_url = os.environ.get("OLLAMA_BASE_URL")
+    ollama_model = os.environ.get("OLLAMA_MODEL")
+    if (ollama_url or ollama_model) and not explicit_service:
+        opts["llm_service"] = "marker.services.ollama.OllamaService"
+    if ollama_url:
+        opts["ollama_base_url"] = ollama_url
+    if ollama_model:
+        opts["ollama_model"] = ollama_model
+
+    # OpenAI-compatible — detected by OPENAI_API_KEY being set
+    openai_key = os.environ.get("OPENAI_API_KEY")
+    openai_url = os.environ.get("OPENAI_BASE_URL")
+    openai_model = os.environ.get("OPENAI_MODEL")
+    if openai_key and not explicit_service and "llm_service" not in opts:
+        opts["llm_service"] = "marker.services.openai.OpenAIService"
+    if openai_key:
+        opts["openai_api_key"] = openai_key
+    if openai_url:
+        opts["openai_base_url"] = openai_url
+    if openai_model:
+        opts["openai_model"] = openai_model
+
+    # Claude
+    claude_key = os.environ.get("CLAUDE_API_KEY")
+    claude_model = os.environ.get("CLAUDE_MODEL")
+    if claude_key and not explicit_service and "llm_service" not in opts:
+        opts["llm_service"] = "marker.services.claude.ClaudeService"
+    if claude_key:
+        opts["claude_api_key"] = claude_key
+    if claude_model:
+        opts["claude_model_name"] = claude_model
+
+    # Gemini is the marker default — just needs GOOGLE_API_KEY in env, no extra opts needed.
+
+    return opts
+
 
 # ---------------------------------------------------------------------------
 # Module-level model initialisation — fail fast with a clear error message.

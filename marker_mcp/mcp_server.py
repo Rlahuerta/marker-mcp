@@ -18,6 +18,7 @@ import click
 from fastmcp import FastMCP
 
 import marker_mcp.conversion_service as svc
+from marker_mcp.conversion_service import _llm_options_from_env
 
 mcp = FastMCP(name="Marker Document Conversion Service")
 
@@ -139,6 +140,8 @@ def _build_options(
         opts["paginate_output"] = True
     if use_llm:
         opts["use_llm"] = True
+        # Inject LLM service configuration from environment variables.
+        opts.update(_llm_options_from_env())
     return opts
 
 
