@@ -16,7 +16,8 @@ marker_mcp = "marker_mcp.mcp_server:mcp_server_cli"
 
 # ---------------------------------------------------------------------------
 # Local development: reference the sibling marker repo instead of PyPI.
-# Remove this section (or comment it out) to use the published PyPI release.
+# This is used when developing with uv directly.
+# For conda-based development, the sibling is installed via environment.yml.
 # ---------------------------------------------------------------------------
 [tool.uv.sources]
 marker-pdf = { path = "../marker", editable = true }

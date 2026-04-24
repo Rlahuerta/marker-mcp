@@ -101,15 +101,22 @@ MARKER_MCP_TRANSPORT=sse bash start_mcp.sh
 
 ## Development setup
 
+Uses **conda** for local development — conda handles CUDA/PyTorch binary packages
+more reliably than pip/uv.
+
 ```bash
-# Requires uv — https://docs.astral.sh/uv/
+# Create the conda env "marker-mcp" (uses environment.yml)
 bash build_venv.sh
-source .venv/bin/activate
+
+conda activate marker-mcp
 marker_mcp --help
 ```
 
-The `pyproject.toml` contains a `[tool.uv.sources]` entry that points `marker-pdf` at the
-sibling `../marker` directory. Remove or comment it out to use the published PyPI package.
+The `environment.yml` installs the sibling `../marker` repo in editable mode by default.
+Swap the commented lines to use the published `marker-pdf` package from PyPI instead.
+
+> **Tip:** Install [mamba](https://mamba.readthedocs.io) for a much faster conda solver:
+> `conda install -n base -c conda-forge mamba`
 
 ---
 

@@ -1,0 +1,21 @@
+name: marker-mcp
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pytorch-cuda=12.1
+  - pip
+  - pip:
+    # Local sibling marker repo — comment out and use marker-pdf below for PyPI release
+    - -e ../marker
+    # - marker-pdf[full]   # ← uncomment when not using the local sibling repo
+    - fastmcp>=2.0.0
+    - click>=8.0.0
+    # Install this package itself in editable mode
+    - -e .
