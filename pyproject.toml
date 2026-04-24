@@ -27,6 +27,7 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
     "integration: requires real Marker models and an actual PDF file (deselect with '-m not integration')",
+    "ollama_cloud: requires Ollama Cloud access — .env with OLLAMA_MODEL=*-cloud and running Ollama daemon",
 ]
 
 [build-system]

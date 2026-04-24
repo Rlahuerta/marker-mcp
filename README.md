@@ -105,8 +105,14 @@ Uses **conda** for local development — conda handles CUDA/PyTorch binary packa
 more reliably than pip/uv.
 
 ```bash
+# activate conda root env (if isn't already active)
+source ~/anaconda3/bin/activate root
+
 # Create the conda env "marker-mcp" (uses environment.yml)
 bash build_venv.sh
+
+# (or) Create env from curated spec (first time)
+conda env create -f environment.yml
 
 conda activate marker-mcp
 marker_mcp --help
@@ -365,6 +371,105 @@ Available service paths:
 > conversion. Expect 30–120 seconds per page depending on the model and hardware.
 > For bulk processing use `convert_documents_batch` which processes files sequentially
 > without blocking the event loop.
+
+---
+
+## Setup with AI coding tools
+
+### GitHub Copilot (VS Code)
+
+GitHub Copilot supports MCP servers through a `mcp.json` file in your workspace or
+user profile. [Full reference](https://code.visualstudio.com/docs/copilot/reference/mcp-configuration).
+
+#### Local (stdio via conda)
+
+First, find the absolute path to the `marker_mcp` binary in your conda env:
+
+```bash
+conda activate marker-mcp
+which marker_mcp
+# Example: /home/user/.conda/envs/marker-mcp/bin/marker_mcp
+```
+
+Create or edit `.vscode/mcp.json` in your workspace (or run **MCP: Open User Configuration**
+from the VS Code Command Palette for a global config):
+
+```json
+{
+  "servers": {
+    "marker": {
+      "type": "stdio",
+      "command": "/home/user/.conda/envs/marker-mcp/bin/marker_mcp",
+      "envFile": "${workspaceFolder}/.env"
+    }
+  }
+}
+```
+
+> **Tip:** `envFile` automatically loads your `.env` (Ollama, OpenAI, etc.) so you don't
+> need to duplicate env vars in the config.
+
+#### Docker (SSE)
+
+Start the container first (`docker compose up marker-mcp-gpu`), then add to `mcp.json`:
+
+```json
+{
+  "servers": {
+    "marker": {
+      "type": "sse",
+      "url": "http://localhost:8000/sse"
+    }
+  }
+}
+```
+
+---
+
+### opencode
+
+[opencode](https://opencode.ai) reads MCP server config from `~/.config/opencode/config.json`
+(global) or `opencode.json` in your project root.
+[Full reference](https://opencode.ai/docs/mcp-servers).
+
+#### Local (stdio via conda)
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "marker": {
+      "type": "local",
+      "command": ["/home/user/.conda/envs/marker-mcp/bin/marker_mcp"],
+      "enabled": true,
+      "environment": {
+        "OLLAMA_BASE_URL": "http://localhost:11434",
+        "OLLAMA_MODEL": "gemma4:31b-cloud"
+      }
+    }
+  }
+}
+```
+
+Replace the environment values (or the entire `environment` block) with your preferred LLM
+service variables from the [Environment variables](#environment-variables) table.
+
+#### Docker (remote)
+
+Start the container first, then:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "marker": {
+      "type": "remote",
+      "url": "http://localhost:8000/sse",
+      "enabled": true
+    }
+  }
+}
+```
 
 ---
 
