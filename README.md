@@ -121,6 +121,10 @@ marker_mcp --help
 The `environment.yml` installs the sibling `../marker` repo in editable mode by default.
 Swap the commented lines to use the published `marker-pdf` package from PyPI instead.
 
+> **Note:** The provided `environment.yml` is NVIDIA/CUDA-oriented. For AMD GPUs,
+> replace the torch packages with a ROCm-compatible PyTorch stack, then start the
+> server with `MARKER_MCP_OCR_DEVICE=amd` (or `rocm`).
+
 > **Tip:** Install [mamba](https://mamba.readthedocs.io) for a much faster conda solver:
 > `conda install -n base -c conda-forge mamba`
 
@@ -133,6 +137,7 @@ Swap the commented lines to use the published `marker-pdf` package from PyPI ins
 | `MARKER_MCP_TRANSPORT` | `stdio` | Transport: `stdio`, `sse`, `http` |
 | `MARKER_MCP_HOST` | `0.0.0.0` | Bind host (SSE/HTTP only) |
 | `MARKER_MCP_PORT` | `8000` | Bind port (SSE/HTTP only) |
+| `MARKER_MCP_OCR_DEVICE` | `auto` | OCR/model device override: `auto`, `cpu`, `cuda`, `nvidia`, `amd`, `rocm`, `mps` |
 | `CUDA_VISIBLE_DEVICES` | *(auto)* | Set to `""` to force CPU-only mode |
 | `MARKER_LLM_SERVICE` | *(auto)* | Override LLM service class explicitly |
 | `GOOGLE_API_KEY` | *(none)* | Gemini API key — auto-selects `GoogleGeminiService` |
@@ -144,6 +149,41 @@ Swap the commented lines to use the published `marker-pdf` package from PyPI ins
 | `OPENAI_MODEL` | `gpt-4o-mini` | OpenAI model name |
 | `CLAUDE_API_KEY` | *(none)* | Anthropic key — auto-selects `ClaudeService` |
 | `CLAUDE_MODEL` | `claude-3-5-sonnet-20241022` | Claude model name |
+
+---
+
+### OCR runtime selection
+
+Marker's OCR/layout/table stack runs locally even when `use_llm=True`, so you may need
+to pin the local model runtime to a specific accelerator.
+
+`marker-mcp` exposes a startup-level selector for this:
+
+```bash
+# CPU-only OCR / layout / table models
+MARKER_MCP_OCR_DEVICE=cpu marker_mcp --transport stdio
+
+# NVIDIA CUDA
+MARKER_MCP_OCR_DEVICE=cuda marker_mcp --transport stdio
+
+# AMD GPU with ROCm-enabled PyTorch
+# (PyTorch still uses the "cuda" device string under ROCm, so marker-mcp
+# accepts both `amd` and `rocm` and maps them to the right Marker setting.)
+MARKER_MCP_OCR_DEVICE=rocm marker_mcp --transport stdio
+```
+
+You can also pass the same selector as a CLI option:
+
+```bash
+marker_mcp --transport stdio --ocr-device cpu
+marker_mcp --transport stdio --ocr-device rocm
+```
+
+Notes:
+
+- `cpu` is useful when using Ollama Cloud or another remote LLM but local VRAM is limited.
+- `amd` / `rocm` require a ROCm-compatible PyTorch build in your environment.
+- `auto` leaves device selection to Marker / PyTorch detection.
 
 ---
 

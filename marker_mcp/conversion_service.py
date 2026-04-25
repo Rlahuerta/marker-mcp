@@ -15,6 +15,57 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
+_AUTO_DEVICE_SENTINEL = "__auto__"
+_OCR_DEVICE_ALIAS_MAP = {
+    "auto": _AUTO_DEVICE_SENTINEL,
+    "cpu": "cpu",
+    "cuda": "cuda",
+    "nvidia": "cuda",
+    "rocm": "cuda",
+    "amd": "cuda",
+    "mps": "mps",
+}
+
+
+def _resolve_ocr_device_override(raw_value: str | None) -> str | None:
+    """Map the MCP OCR device selector to Marker's TORCH_DEVICE values.
+
+    Marker expects torch-style device strings (`cpu`, `cuda`, `mps`). For ROCm
+    builds, PyTorch still uses the `cuda` device string, so the AMD/ROCm aliases
+    deliberately map to `cuda`.
+    """
+    if raw_value is None:
+        return None
+
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return None
+
+    if normalized not in _OCR_DEVICE_ALIAS_MAP:
+        supported = ", ".join(sorted(_OCR_DEVICE_ALIAS_MAP))
+        raise ValueError(
+            f"Unsupported MARKER_MCP_OCR_DEVICE={raw_value!r}. "
+            f"Expected one of: {supported}."
+        )
+
+    return _OCR_DEVICE_ALIAS_MAP[normalized]
+
+
+def _apply_ocr_device_override_from_env() -> None:
+    """Translate MARKER_MCP_OCR_DEVICE into Marker's TORCH_DEVICE env var."""
+    override = _resolve_ocr_device_override(os.environ.get("MARKER_MCP_OCR_DEVICE"))
+    if override is None:
+        return
+
+    if override == _AUTO_DEVICE_SENTINEL:
+        os.environ.pop("TORCH_DEVICE", None)
+        return
+
+    os.environ["TORCH_DEVICE"] = override
+
+
+_apply_ocr_device_override_from_env()
+
 from marker.config.parser import ConfigParser
 from marker.converters.pdf import PdfConverter
 from marker.models import create_model_dict

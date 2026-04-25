@@ -12,10 +12,16 @@ dependencies:
   - pytorch-cuda=12.1
   - pip
   - pip:
-    # Local sibling marker repo — comment out and use marker-pdf below for PyPI release
-    - -e ../marker
-    # - marker-pdf[full]   # ← uncomment when not using the local sibling repo
+    # Pin the torch/transformers runtime that passes the real integration suite.
+    # marker-pdf / surya-ocr can otherwise pull a newer torch stack that leaves
+    # torchvision / torchaudio out of sync in an existing conda env.
+    - torch==2.11.0
+    - torchvision==0.26.0
+    - torchaudio==2.11.0
+    - transformers==4.56.2
+    - marker-pdf[full]   # ← uncomment when not using the local sibling repo
     - fastmcp>=2.0.0
     - click>=8.0.0
+    - ollama
     # Install this package itself in editable mode
     - -e .

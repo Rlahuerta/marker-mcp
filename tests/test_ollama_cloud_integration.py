@@ -34,6 +34,7 @@ import urllib.request
 from pathlib import Path
 
 import pytest
+from tests import conftest as test_support
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -109,20 +110,20 @@ def load_real_models_and_env():
 
     # Inject OLLAMA_* vars so the reloaded conversion_service picks them up
     saved: dict[str, str | None] = {}
-    for key in ("OLLAMA_BASE_URL", "OLLAMA_MODEL", "MARKER_LLM_SERVICE"):
+    for key in ("OLLAMA_BASE_URL", "OLLAMA_MODEL", "MARKER_LLM_SERVICE", "CUDA_VISIBLE_DEVICES"):
         saved[key] = os.environ.get(key)
         if key in env:
             os.environ[key] = env[key]
 
-    # Clear any cached (mocked) marker_mcp modules from the unit-test conftest
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("marker_mcp"):
-            del sys.modules[mod]
+    test_support._clear_marker_mcp_modules()
+    test_support._clear_marker_mock_modules()
+    test_support._release_torch_resources()
 
     # Fresh import — calls the real create_model_dict()
     try:
         import marker_mcp.conversion_service  # noqa: F401
     except Exception as exc:
+        test_support._restore_mocked_marker_mcp()
         pytest.skip(f"Could not load real Marker models: {exc}")
 
     yield
@@ -134,9 +135,7 @@ def load_real_models_and_env():
         else:
             os.environ[key] = val
 
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("marker_mcp"):
-            del sys.modules[mod]
+    test_support._restore_mocked_marker_mcp()
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +146,12 @@ def _require_fixture(path: Path) -> str:
     if not path.exists():
         pytest.skip(f"Fixture PDF not found: {path}")
     return str(path)
+
+
+def _llm_options() -> dict:
+    import marker_mcp.mcp_server as server
+
+    return server._build_options("markdown", None, False, False, True)
 
 
 # ---------------------------------------------------------------------------
@@ -171,7 +176,7 @@ async def test_ollama_cloud_convert_simple():
     import marker_mcp.conversion_service as svc
 
     pdf_path = _require_fixture(SAMPLE_PDF)
-    result = await svc.convert_file(pdf_path, use_llm=True)
+    result = await svc.convert_file(pdf_path, _llm_options())
 
     assert isinstance(result, str), "Expected string output"
     assert len(result) > 200, (
@@ -198,7 +203,7 @@ async def test_ollama_cloud_convert_complex_document():
     import marker_mcp.conversion_service as svc
 
     pdf_path = _require_fixture(COMPLEX_PDF)
-    result = await svc.convert_file(pdf_path, use_llm=True)
+    result = await svc.convert_file(pdf_path, _llm_options())
 
     assert isinstance(result, str)
     assert len(result) > 500, (
@@ -232,8 +237,9 @@ async def test_ollama_cloud_via_mcp_tool():
             {"filepath": pdf_path, "use_llm": True},
         )
 
-    assert result, "MCP tool returned empty result"
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
+    assert result.content, "MCP tool returned empty result"
+    first = result.content[0]
+    text = first.text if hasattr(first, "text") else str(first)
     assert len(text) > 200, f"MCP tool output too short: {len(text)} chars"
     assert "#" in text, "Expected markdown output from MCP tool"
 
@@ -245,7 +251,7 @@ async def test_ollama_cloud_convert_bytes_path():
     pdf_path = _require_fixture(SAMPLE_PDF)
     pdf_bytes = Path(pdf_path).read_bytes()
 
-    result = await svc.convert_bytes(pdf_bytes, "sample.pdf", use_llm=True)
+    result = await svc.convert_bytes(pdf_bytes, "sample.pdf", _llm_options())
 
     assert isinstance(result, str)
     assert len(result) > 200

@@ -2,7 +2,9 @@
 
 import asyncio
 import base64
+import importlib
 import os
+import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -24,6 +26,71 @@ def _make_mock_converter(return_text: str = "# Hello World\n\nTest content."):
         pass  # just documenting the expected patch target
 
     return converter_mock, rendered_mock, return_text
+
+
+# ---------------------------------------------------------------------------
+# OCR device override
+# ---------------------------------------------------------------------------
+
+class TestOcrDeviceOverride:
+    def test_resolve_cpu(self):
+        assert svc._resolve_ocr_device_override("cpu") == "cpu"
+
+    def test_resolve_amd_aliases_to_cuda(self):
+        assert svc._resolve_ocr_device_override("amd") == "cuda"
+        assert svc._resolve_ocr_device_override("rocm") == "cuda"
+
+    def test_resolve_auto(self):
+        assert svc._resolve_ocr_device_override("auto") == svc._AUTO_DEVICE_SENTINEL
+
+    def test_invalid_value_raises(self):
+        with pytest.raises(ValueError, match="Unsupported MARKER_MCP_OCR_DEVICE"):
+            svc._resolve_ocr_device_override("directml")
+
+    def test_apply_sets_torch_device(self, monkeypatch):
+        monkeypatch.setenv("MARKER_MCP_OCR_DEVICE", "cpu")
+        monkeypatch.delenv("TORCH_DEVICE", raising=False)
+
+        svc._apply_ocr_device_override_from_env()
+
+        assert os.environ["TORCH_DEVICE"] == "cpu"
+
+    def test_apply_auto_clears_torch_device(self, monkeypatch):
+        monkeypatch.setenv("MARKER_MCP_OCR_DEVICE", "auto")
+        monkeypatch.setenv("TORCH_DEVICE", "cuda")
+
+        svc._apply_ocr_device_override_from_env()
+
+        assert "TORCH_DEVICE" not in os.environ
+
+
+# ---------------------------------------------------------------------------
+# _build_converter
+# ---------------------------------------------------------------------------
+
+class TestBuildConverter:
+    def test_builds_pdf_converter_with_config_parser_outputs(self):
+        parser = MagicMock()
+        parser.generate_config_dict.return_value = {"output_format": "json"}
+        parser.get_processors.return_value = ["proc"]
+        parser.get_renderer.return_value = "renderer"
+        parser.get_llm_service.return_value = "llm"
+
+        with (
+            patch("marker_mcp.conversion_service.ConfigParser", return_value=parser) as mock_parser_cls,
+            patch("marker_mcp.conversion_service.PdfConverter", return_value="converter") as mock_pdf_converter,
+        ):
+            result = svc._build_converter({"output_format": "json"})
+
+        assert result == "converter"
+        mock_parser_cls.assert_called_once_with({"output_format": "json"})
+        mock_pdf_converter.assert_called_once_with(
+            config={"output_format": "json", "pdftext_workers": 1},
+            artifact_dict=svc._MODELS,
+            processor_list=["proc"],
+            renderer="renderer",
+            llm_service="llm",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +186,23 @@ class TestConvertBytes:
 
         assert not os.path.exists(temp_paths[0]), "Temp file must be cleaned up even on error"
 
+    async def test_cleanup_ignores_oserror(self, minimal_pdf_bytes):
+        temp_paths: list[str] = []
+
+        async def spy_convert(filepath, options=None):
+            temp_paths.append(filepath)
+            return "ok"
+
+        with (
+            patch("marker_mcp.conversion_service.convert_file", side_effect=spy_convert),
+            patch("marker_mcp.conversion_service.os.unlink", side_effect=OSError("busy")),
+        ):
+            result = await svc.convert_bytes(minimal_pdf_bytes, "test.pdf")
+
+        assert result == "ok"
+        assert len(temp_paths) == 1
+        Path(temp_paths[0]).unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # convert_bytes_batch
@@ -188,3 +272,24 @@ class TestConvertBytesBatch:
             ])
 
         assert results[0]["filename"] == "document.pdf"
+
+
+# ---------------------------------------------------------------------------
+# module import behavior
+# ---------------------------------------------------------------------------
+
+class TestModuleImport:
+    def test_model_init_failure_keeps_models_none_and_logs(self):
+        marker_models = sys.modules["marker.models"]
+        original_create_model_dict = marker_models.create_model_dict
+
+        try:
+            marker_models.create_model_dict = MagicMock(side_effect=RuntimeError("boom"))
+            with patch("builtins.print") as mock_print:
+                importlib.reload(svc)
+
+            assert svc._MODELS is None
+            mock_print.assert_any_call("❌ Failed to load Marker models: boom")
+        finally:
+            marker_models.create_model_dict = original_create_model_dict
+            importlib.reload(svc)

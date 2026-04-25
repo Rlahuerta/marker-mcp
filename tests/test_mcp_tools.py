@@ -7,16 +7,19 @@ from unittest.mock import patch
 import pytest
 from fastmcp import Client
 
-from marker_mcp.mcp_server import mcp
-
-
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _current_mcp():
+    import marker_mcp.mcp_server as server
+
+    return server.mcp
+
+
 async def _call(tool_name: str, **kwargs):
     """Call a tool through the in-process fastmcp Client and return the text payload."""
-    async with Client(mcp) as client:
+    async with Client(_current_mcp()) as client:
         result = await client.call_tool(tool_name, kwargs)
     # result is a CallToolResult; .content is a list of content items
     assert result.content, f"Tool '{tool_name}' returned no content"
@@ -57,7 +60,7 @@ class TestGetConverterStatus:
 
 class TestListTools:
     async def test_all_four_tools_registered(self):
-        async with Client(mcp) as client:
+        async with Client(_current_mcp()) as client:
             tools = await client.list_tools()
         names = {t.name for t in tools}
         assert names == {
@@ -68,7 +71,7 @@ class TestListTools:
         }
 
     async def test_tools_have_descriptions(self):
-        async with Client(mcp) as client:
+        async with Client(_current_mcp()) as client:
             tools = await client.list_tools()
         for tool in tools:
             assert tool.description, f"Tool '{tool.name}' has no description"

@@ -1,8 +1,14 @@
 """Unit tests for _build_options() in mcp_server and get_status() in conversion_service."""
 
+import runpy
+import sys
+from unittest.mock import patch
+
 import pytest
+from click.testing import CliRunner
 
 import marker_mcp.conversion_service as svc
+import marker_mcp.mcp_server as server
 from marker_mcp.mcp_server import _build_options
 
 
@@ -85,3 +91,50 @@ class TestGetStatus:
     def test_status_has_required_keys(self):
         result = svc.get_status()
         assert set(result.keys()) == {"initialized", "status", "message"}
+
+
+class TestMcpServerCli:
+    def test_stdio_transport_runs_stdio(self):
+        runner = CliRunner()
+        with patch.object(server.mcp, "run") as mock_run:
+            result = runner.invoke(server.mcp_server_cli, ["--transport", "stdio"])
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(transport="stdio")
+
+    def test_http_transport_passes_host_and_port(self):
+        runner = CliRunner()
+        with patch.object(server.mcp, "run") as mock_run:
+            result = runner.invoke(
+                server.mcp_server_cli,
+                ["--transport", "http", "--host", "127.0.0.1", "--port", "9001"],
+            )
+
+        assert result.exit_code == 0
+        mock_run.assert_called_once_with(transport="http", host="127.0.0.1", port=9001)
+
+    def test_ocr_device_sets_env_and_reloads_service(self, monkeypatch):
+        runner = CliRunner()
+        monkeypatch.delenv("MARKER_MCP_OCR_DEVICE", raising=False)
+
+        with (
+            patch.object(server.mcp, "run") as mock_run,
+            patch("importlib.reload") as mock_reload,
+        ):
+            result = runner.invoke(server.mcp_server_cli, ["--transport", "stdio", "--ocr-device", "cpu"])
+
+        assert result.exit_code == 0
+        assert server.os.environ["MARKER_MCP_OCR_DEVICE"] == "cpu"
+        mock_reload.assert_called_once()
+        mock_run.assert_called_once_with(transport="stdio")
+
+    def test_main_guard_invokes_click_command(self):
+        existing = sys.modules.pop("marker_mcp.mcp_server", None)
+        try:
+            with patch("click.core.Command.main", return_value=None) as mock_main:
+                runpy.run_module("marker_mcp.mcp_server", run_name="__main__")
+        finally:
+            if existing is not None:
+                sys.modules["marker_mcp.mcp_server"] = existing
+
+        mock_main.assert_called_once()

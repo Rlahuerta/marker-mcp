@@ -7,6 +7,7 @@ submodules BEFORE `marker_mcp.conversion_service` is first imported.  This:
   - Still allows integration tests to reload with real models (see test_integration.py)
 """
 
+import gc
 import os
 import sys
 from pathlib import Path
@@ -25,6 +26,15 @@ _MOCK_MODELS = {
     "detection_model": MagicMock(name="detection_model"),
     "edit_model": MagicMock(name="edit_model"),
 }
+
+_MARKER_MOCK_MODULES = (
+    "marker.models",
+    "marker.config",
+    "marker.config.parser",
+    "marker.converters",
+    "marker.converters.pdf",
+    "marker.output",
+)
 
 # ---------------------------------------------------------------------------
 # Inject sys.modules mocks for all marker ML submodules BEFORE import.
@@ -68,7 +78,52 @@ def _inject_marker_mocks() -> None:
     }
 
     for name, mock in modules_to_inject.items():
-        sys.modules.setdefault(name, mock)
+        sys.modules[name] = mock
+
+
+def _clear_marker_mock_modules() -> None:
+    """Remove the mocked Marker ML modules so integration tests can import the real package."""
+    for name in _MARKER_MOCK_MODULES:
+        sys.modules.pop(name, None)
+
+
+def _clear_marker_mcp_modules() -> None:
+    """Discard cached marker_mcp modules so the next import gets a clean module graph."""
+    for mod in list(sys.modules.keys()):
+        if mod.startswith("marker_mcp"):
+            del sys.modules[mod]
+
+
+def _release_torch_resources() -> None:
+    """Best-effort release of Python and CUDA resources between integration modules."""
+    gc.collect()
+
+    try:
+        import torch
+    except Exception:
+        return
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def _restore_mocked_marker_mcp() -> None:
+    """Restore the mocked marker_mcp module graph used by the unit-style tests."""
+    global _svc_module, _server_module
+
+    _clear_marker_mcp_modules()
+    _clear_marker_mock_modules()
+    _release_torch_resources()
+    _inject_marker_mocks()
+
+    import marker_mcp.conversion_service as _svc_module  # noqa: E402
+    import marker_mcp.mcp_server as _server_module  # noqa: E402
+
+    _svc_module._MODELS = _MOCK_MODELS
 
 
 if "marker_mcp.conversion_service" not in sys.modules:
@@ -159,11 +214,17 @@ def sample_pdf_path() -> Path | None:
 
 
 @pytest.fixture(autouse=True)
-def reset_mock_models():
-    """Ensure _MODELS is the mock dict before each unit test."""
-    _svc_module._MODELS = _MOCK_MODELS
+def reset_mock_models(request):
+    """Ensure non-integration tests always use the lightweight mock model dict."""
+    if request.node.get_closest_marker("integration"):
+        yield
+        return
+
+    import marker_mcp.conversion_service as svc_module
+
+    svc_module._MODELS = _MOCK_MODELS
     yield
-    _svc_module._MODELS = _MOCK_MODELS
+    svc_module._MODELS = _MOCK_MODELS
 
 
 @pytest.fixture
@@ -183,3 +244,19 @@ def clean_llm_env(monkeypatch):
         monkeypatch.delenv(var, raising=False)
     yield
 
+
+def pytest_collection_modifyitems(items):
+    """Run the heavier Ollama Cloud integration module before the other real-model file.
+
+    Keep unit-style tests first so they always run against the mocked module graph,
+    then run the heavier Ollama Cloud module before the other real-model integration
+    file. In a single pytest process this avoids a second large GPU model load late
+    in the run, which can fragment memory and cause otherwise passing integration
+    tests to fail with CUDA OOM.
+    """
+
+    priority = {
+        "tests/test_ollama_cloud_integration.py": 1,
+        "tests/test_integration.py": 2,
+    }
+    items.sort(key=lambda item: (priority.get(item.location[0], 0), item.location[0], item.location[1]))

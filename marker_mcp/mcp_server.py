@@ -13,14 +13,31 @@ Usage:
 from __future__ import annotations
 
 import base64 as _b64
+import importlib
+import os
+import sys
 
 import click
 from fastmcp import FastMCP
 
-import marker_mcp.conversion_service as svc
-from marker_mcp.conversion_service import _llm_options_from_env
-
 mcp = FastMCP(name="Marker Document Conversion Service")
+
+
+def _conversion_service():
+    import marker_mcp.conversion_service as svc
+
+    return svc
+
+
+def _configure_ocr_device(ocr_device: str | None) -> None:
+    """Apply the OCR device selector before the conversion service is used."""
+    if ocr_device is None:
+        return
+
+    os.environ["MARKER_MCP_OCR_DEVICE"] = ocr_device
+
+    if "marker_mcp.conversion_service" in sys.modules:
+        importlib.reload(sys.modules["marker_mcp.conversion_service"])
 
 
 # ---------------------------------------------------------------------------
@@ -50,7 +67,7 @@ async def convert_document(
         use_llm: Use an LLM for higher accuracy (requires GOOGLE_API_KEY or compatible service).
     """
     options = _build_options(output_format, page_range, force_ocr, paginate_output, use_llm)
-    return await svc.convert_file(filepath, options)
+    return await _conversion_service().convert_file(filepath, options)
 
 
 @mcp.tool
@@ -78,7 +95,7 @@ async def convert_document_from_content(
     """
     options = _build_options(output_format, page_range, force_ocr, paginate_output, use_llm)
     content = _b64.b64decode(content_base64)
-    return await svc.convert_bytes(content, filename, options)
+    return await _conversion_service().convert_bytes(content, filename, options)
 
 
 @mcp.tool
@@ -96,7 +113,7 @@ async def convert_documents_batch(files: list[dict]) -> dict:
             summary: {total, successful, failed}
         }
     """
-    results = await svc.convert_bytes_batch(files)
+    results = await _conversion_service().convert_bytes_batch(files)
     successful = sum(1 for r in results if r["success"])
     return {
         "results": results,
@@ -117,7 +134,7 @@ async def get_converter_status() -> dict:
     Returns:
         {initialized: bool, status: "ready" | "failed", message: str}
     """
-    return svc.get_status()
+    return _conversion_service().get_status()
 
 
 # ---------------------------------------------------------------------------
@@ -141,7 +158,7 @@ def _build_options(
     if use_llm:
         opts["use_llm"] = True
         # Inject LLM service configuration from environment variables.
-        opts.update(_llm_options_from_env())
+        opts.update(_conversion_service()._llm_options_from_env())
     return opts
 
 
@@ -170,8 +187,18 @@ def _build_options(
     show_default=True,
     help="Bind port (SSE/HTTP only).",
 )
-def mcp_server_cli(transport: str, host: str, port: int) -> None:
+@click.option(
+    "--ocr-device",
+    default=None,
+    type=click.Choice(["auto", "cpu", "cuda", "nvidia", "amd", "rocm", "mps"]),
+    help=(
+        "OCR runtime device for Marker's local models. "
+        "Use 'cpu' for a CPU-only OCR path and 'amd'/'rocm' for ROCm-backed PyTorch."
+    ),
+)
+def mcp_server_cli(transport: str, host: str, port: int, ocr_device: str | None) -> None:
     """Start the Marker MCP server."""
+    _configure_ocr_device(ocr_device)
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:

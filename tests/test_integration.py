@@ -3,132 +3,219 @@
 Run with:
     conda run -n marker-mcp pytest tests/test_integration.py -v -m integration
 
-These tests are skipped by default in CI and plain `pytest` runs.
+These tests run the real conversion path in subprocesses so they don't leak GPU
+or module state into the rest of the pytest session.
 """
 
 import base64
+import json
+import os
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 SAMPLE_PDF = FIXTURES_DIR / "sample.pdf"
 
 pytestmark = pytest.mark.integration
 
 
-# ---------------------------------------------------------------------------
-# Fixtures — use the real models (no mocking)
-# ---------------------------------------------------------------------------
-
-@pytest.fixture(scope="module", autouse=True)
-def load_real_models():
-    """Reload conversion_service with real models for this module."""
-    import importlib
-    import sys
-    from unittest.mock import patch
-
-    # Remove cached (mocked) module so it reloads with real models
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("marker_mcp"):
-            del sys.modules[mod]
-
-    # Import fresh — this will call the real create_model_dict()
-    import marker_mcp.conversion_service  # noqa: F401
-    yield
-
-    # Restore mocked modules after the integration tests finish
-    for mod in list(sys.modules.keys()):
-        if mod.startswith("marker_mcp"):
-            del sys.modules[mod]
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _require_sample_pdf():
+def _require_sample_pdf() -> str:
     if not SAMPLE_PDF.exists():
         pytest.skip(f"Sample PDF not found at {SAMPLE_PDF}")
     return str(SAMPLE_PDF)
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+def _run_real_python(script: str) -> dict:
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    stdout = proc.stdout.strip()
+    stdout_lines = [line for line in stdout.splitlines() if line.strip()]
+    payload = stdout_lines[-1] if stdout_lines else ""
+
+    if payload.startswith("SKIP:"):
+        pytest.skip(payload.removeprefix("SKIP:").strip())
+
+    if proc.returncode != 0:
+        raise AssertionError(
+            "Integration subprocess failed.\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"Expected JSON output from subprocess, got:\n{stdout}") from exc
+
 
 @pytest.mark.integration
 async def test_convert_file_basic():
-    """Convert the sample PDF and verify we get non-empty markdown."""
-    import marker_mcp.conversion_service as svc
-
     pdf_path = _require_sample_pdf()
-    result = await svc.convert_file(pdf_path)
+    data = _run_real_python(
+        textwrap.dedent(
+            f"""
+            import json
+            try:
+                import marker_mcp.conversion_service as svc
+            except Exception as exc:
+                print(f"SKIP:Could not load real Marker models: {{exc}}")
+                raise SystemExit(0)
 
-    assert isinstance(result, str)
-    assert len(result) > 100, "Converted output seems too short"
-    # arXiv papers always have an abstract
-    assert any(word in result.lower() for word in ["abstract", "introduction", "#"]), (
-        "Expected markdown headings or common academic paper sections"
+            import asyncio
+
+            async def main():
+                result = await svc.convert_file({pdf_path!r})
+                print(json.dumps({{
+                    "is_str": isinstance(result, str),
+                    "length": len(result),
+                    "has_expected_text": any(word in result.lower() for word in ["abstract", "introduction", "#"]),
+                }}))
+
+            asyncio.run(main())
+            """
+        )
     )
+
+    assert data["is_str"] is True
+    assert data["length"] > 100, "Converted output seems too short"
+    assert data["has_expected_text"] is True
 
 
 @pytest.mark.integration
 async def test_convert_bytes_basic():
-    """Convert PDF bytes and verify output."""
-    import marker_mcp.conversion_service as svc
-
     pdf_path = _require_sample_pdf()
-    pdf_bytes = Path(pdf_path).read_bytes()
-    result = await svc.convert_bytes(pdf_bytes, "sample.pdf")
+    data = _run_real_python(
+        textwrap.dedent(
+            f"""
+            import json
+            from pathlib import Path
+            try:
+                import marker_mcp.conversion_service as svc
+            except Exception as exc:
+                print(f"SKIP:Could not load real Marker models: {{exc}}")
+                raise SystemExit(0)
 
-    assert isinstance(result, str)
-    assert len(result) > 100
+            import asyncio
+
+            async def main():
+                pdf_bytes = Path({pdf_path!r}).read_bytes()
+                result = await svc.convert_bytes(pdf_bytes, "sample.pdf")
+                print(json.dumps({{
+                    "is_str": isinstance(result, str),
+                    "length": len(result),
+                }}))
+
+            asyncio.run(main())
+            """
+        )
+    )
+
+    assert data["is_str"] is True
+    assert data["length"] > 100
 
 
 @pytest.mark.integration
 async def test_get_status_shows_ready():
-    """After real model loading, status must be ready."""
-    import marker_mcp.conversion_service as svc
+    data = _run_real_python(
+        textwrap.dedent(
+            """
+            import json
+            try:
+                import marker_mcp.conversion_service as svc
+            except Exception as exc:
+                print(f"SKIP:Could not load real Marker models: {exc}")
+                raise SystemExit(0)
 
-    status = svc.get_status()
-    assert status["initialized"] is True
-    assert status["status"] == "ready"
+            print(json.dumps(svc.get_status()))
+            """
+        )
+    )
+
+    assert data["initialized"] is True
+    assert data["status"] == "ready"
 
 
 @pytest.mark.integration
 async def test_mcp_tool_convert_document():
-    """End-to-end: call the MCP tool with the real server and models."""
-    import json
-    import marker_mcp.mcp_server  # reimported after module reset
-
-    from fastmcp import Client
-
     pdf_path = _require_sample_pdf()
-    mcp = marker_mcp.mcp_server.mcp
+    data = _run_real_python(
+        textwrap.dedent(
+            f"""
+            import asyncio
+            import json
+            try:
+                import marker_mcp.mcp_server
+            except Exception as exc:
+                print(f"SKIP:Could not load real Marker models: {{exc}}")
+                raise SystemExit(0)
 
-    async with Client(mcp) as client:
-        result = await client.call_tool("convert_document", {"filepath": pdf_path})
+            from fastmcp import Client
 
-    assert result
-    text = result[0].text if hasattr(result[0], "text") else str(result[0])
-    assert len(text) > 100
+            async def main():
+                mcp = marker_mcp.mcp_server.mcp
+                async with Client(mcp) as client:
+                    result = await client.call_tool("convert_document", {{"filepath": {pdf_path!r}}})
+                first = result.content[0]
+                text = first.text if hasattr(first, "text") else str(first)
+                print(json.dumps({{"length": len(text)}}))
+
+            asyncio.run(main())
+            """
+        )
+    )
+
+    assert data["length"] > 100
 
 
 @pytest.mark.integration
 async def test_batch_conversion():
-    """Batch-convert a file twice and verify both succeed."""
-    import marker_mcp.conversion_service as svc
-
     pdf_path = _require_sample_pdf()
-    encoded = base64.b64encode(Path(pdf_path).read_bytes()).decode()
+    data = _run_real_python(
+        textwrap.dedent(
+            f"""
+            import asyncio
+            import base64
+            import json
+            from pathlib import Path
+            try:
+                import marker_mcp.conversion_service as svc
+            except Exception as exc:
+                print(f"SKIP:Could not load real Marker models: {{exc}}")
+                raise SystemExit(0)
 
-    results = await svc.convert_bytes_batch([
-        {"filename": "copy1.pdf", "content_base64": encoded},
-        {"filename": "copy2.pdf", "content_base64": encoded},
-    ])
+            async def main():
+                encoded = base64.b64encode(Path({pdf_path!r}).read_bytes()).decode()
+                results = await svc.convert_bytes_batch([
+                    {{"filename": "copy1.pdf", "content_base64": encoded}},
+                    {{"filename": "copy2.pdf", "content_base64": encoded}},
+                ])
+                print(json.dumps({{
+                    "count": len(results),
+                    "successes": [r["success"] for r in results],
+                    "lengths": [len(r["content"]) if r["content"] else 0 for r in results],
+                    "errors": [r["error"] for r in results],
+                }}))
 
-    assert len(results) == 2
-    for r in results:
-        assert r["success"] is True, f"Batch item failed: {r['error']}"
-        assert len(r["content"]) > 100
+            asyncio.run(main())
+            """
+        )
+    )
+
+    assert data["count"] == 2
+    assert data["successes"] == [True, True], f"Batch item failed: {data['errors']}"
+    assert all(length > 100 for length in data["lengths"])

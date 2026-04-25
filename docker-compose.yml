@@ -22,6 +22,8 @@ x-shared-env: &shared-env
   CLAUDE_MODEL: "${CLAUDE_MODEL:-}"
   # Override the service class explicitly (takes priority over all above)
   MARKER_LLM_SERVICE: "${MARKER_LLM_SERVICE:-}"
+  # OCR/model runtime device override: auto, cpu, cuda, nvidia, amd, rocm, mps
+  MARKER_MCP_OCR_DEVICE: "${MARKER_MCP_OCR_DEVICE:-auto}"
 
 services:
   # -------------------------------------------------------------------------
@@ -70,6 +72,7 @@ services:
     volumes: *shared-volumes
     environment:
       <<: *shared-env
+      MARKER_MCP_OCR_DEVICE: "cpu"
       CUDA_VISIBLE_DEVICES: ""
     restart: unless-stopped
     healthcheck:
