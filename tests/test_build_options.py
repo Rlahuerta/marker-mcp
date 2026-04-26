@@ -127,7 +127,6 @@ class TestMcpServerCli:
         assert server.os.environ["MARKER_MCP_OCR_DEVICE"] == "cpu"
         mock_reload.assert_called_once()
         mock_run.assert_called_once_with(transport="stdio")
-
     def test_main_guard_invokes_click_command(self):
         existing = sys.modules.pop("marker_mcp.mcp_server", None)
         try:
