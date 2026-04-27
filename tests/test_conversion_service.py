@@ -3,12 +3,14 @@
 import asyncio
 import base64
 import importlib
+import json
 import os
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from PIL import Image
 
 import marker_mcp.conversion_service as svc
 
@@ -26,6 +28,11 @@ def _make_mock_converter(return_text: str = "# Hello World\n\nTest content."):
         pass  # just documenting the expected patch target
 
     return converter_mock, rendered_mock, return_text
+
+
+def _make_test_figure() -> Image.Image:
+    """Create a tiny in-memory image that mimics a Marker figure export."""
+    return Image.new("RGB", (2, 2), color="white")
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +146,48 @@ class TestConvertFile:
         assert opts["output_format"] == "html"
         assert opts["force_ocr"] is True
 
+    async def test_retries_with_cpu_when_cuda_oom(self, tmp_pdf_file, monkeypatch):
+        original_models = {"device": "cuda"}
+        cpu_models = {"device": "cpu"}
+        svc._MODELS = original_models
+        seen_attempts: list[tuple[str | None, dict]] = []
+
+        def fake_convert(filepath, options):
+            seen_attempts.append((os.environ.get("TORCH_DEVICE"), svc._MODELS))
+            if len(seen_attempts) == 1:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return "# CPU fallback output"
+
+        monkeypatch.delenv("TORCH_DEVICE", raising=False)
+
+        with (
+            patch("marker_mcp.conversion_service._convert_sync", side_effect=fake_convert),
+            patch("marker_mcp.conversion_service._create_models", return_value=cpu_models) as mock_create,
+        ):
+            result = await svc.convert_file(str(tmp_pdf_file))
+
+        assert result == "# CPU fallback output"
+        assert seen_attempts == [(None, original_models), ("cpu", cpu_models)]
+        mock_create.assert_called_once_with(device="cpu")
+        assert svc._MODELS is cpu_models
+
+    async def test_warns_and_falls_back_when_llm_conversion_fails(self, tmp_pdf_file):
+        attempts: list[dict] = []
+
+        def fake_convert(filepath, options):
+            attempts.append(dict(options))
+            if options.get("use_llm"):
+                raise RuntimeError("LLM service unavailable")
+            return "# Fallback output"
+
+        with patch("marker_mcp.conversion_service._convert_sync", side_effect=fake_convert):
+            with pytest.warns(UserWarning, match="LLM"):
+                result = await svc.convert_file(str(tmp_pdf_file), {"use_llm": True})
+
+        assert result == "# Fallback output"
+        assert attempts[0]["use_llm"] is True
+        assert "use_llm" not in attempts[1]
+
 
 # ---------------------------------------------------------------------------
 # convert_bytes
@@ -202,6 +251,21 @@ class TestConvertBytes:
         assert result == "ok"
         assert len(temp_paths) == 1
         Path(temp_paths[0]).unlink(missing_ok=True)
+
+    async def test_convert_bytes_retries_after_cuda_oom(self, minimal_pdf_bytes):
+        call_options: list[dict | None] = []
+
+        async def fake_convert_file(filepath, options=None):
+            call_options.append(options.copy() if options else None)
+            if len(call_options) == 1:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return "# CPU fallback output"
+
+        with patch("marker_mcp.conversion_service.convert_file", side_effect=fake_convert_file):
+            result = await svc.convert_bytes(minimal_pdf_bytes, "test.pdf")
+
+        assert result == "# CPU fallback output"
+        assert len(call_options) == 2
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +343,11 @@ class TestConvertBytesBatch:
 # ---------------------------------------------------------------------------
 
 class TestModuleImport:
+    def test_chunking_dependency_pypdf_available(self):
+        import pypdf
+
+        assert pypdf is not None
+
     def test_model_init_failure_keeps_models_none_and_logs(self):
         marker_models = sys.modules["marker.models"]
         original_create_model_dict = marker_models.create_model_dict
@@ -293,3 +362,185 @@ class TestModuleImport:
         finally:
             marker_models.create_model_dict = original_create_model_dict
             importlib.reload(svc)
+
+
+# ---------------------------------------------------------------------------
+# Chunk helpers
+# ---------------------------------------------------------------------------
+
+class TestChunkHelpers:
+    def test_chunk_page_ranges_for_large_documents(self):
+        assert svc._chunk_page_ranges(total_pages=9, max_pages_per_chunk=4) == [
+            "0-3",
+            "4-7",
+            "8-8",
+        ]
+
+    def test_parse_and_chunk_explicit_page_range(self):
+        assert svc._parse_page_range("0,2,4-6") == [0, 2, 4, 5, 6]
+        assert svc._chunk_requested_page_range("0,2,4-6", max_pages_per_chunk=2) == [
+            "0,2",
+            "4-5",
+            "6",
+        ]
+
+    def test_merge_chunk_texts_preserves_chunk_order(self):
+        assert svc._merge_chunk_texts(["# Chunk 1", "# Chunk 2", "# Chunk 3"]) == (
+            "# Chunk 1\n\n# Chunk 2\n\n# Chunk 3"
+        )
+
+
+class TestChunkedConversionOrchestration:
+    async def test_convert_file_chunks_large_pdfs_when_max_pages_per_chunk_set(self, tmp_pdf_file):
+        calls: list[dict] = []
+        chunk_outputs = {
+            "0-1": "# Chunk 1",
+            "2-3": "# Chunk 2",
+            "4-4": "# Chunk 3",
+        }
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None):
+            calls.append(
+                {
+                    "filepath": filepath,
+                    "options": dict(options),
+                    "sync_converter": sync_converter,
+                    "warnings_list": warnings_list,
+                }
+            )
+            return chunk_outputs[options["page_range"]]
+
+        with (
+            patch("marker_mcp.conversion_service._get_pdf_page_count", return_value=5, create=True),
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+        ):
+            result = await svc.convert_file(
+                str(tmp_pdf_file),
+                {"max_pages_per_chunk": 2, "force_ocr": True},
+            )
+
+        assert result == "# Chunk 1\n\n# Chunk 2\n\n# Chunk 3"
+        assert [call["options"]["page_range"] for call in calls] == ["0-1", "2-3", "4-4"]
+        assert all(call["options"]["force_ocr"] is True for call in calls)
+        assert all("max_pages_per_chunk" not in call["options"] for call in calls)
+        assert all(call["sync_converter"] is svc._convert_sync for call in calls)
+
+    async def test_convert_file_chunks_explicit_page_range_when_max_pages_per_chunk_set(self, tmp_pdf_file):
+        calls: list[dict] = []
+        chunk_outputs = {
+            "0-1": "# Chunk 1",
+            "2-3": "# Chunk 2",
+            "4-5": "# Chunk 3",
+        }
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None):
+            calls.append(
+                {
+                    "filepath": filepath,
+                    "options": dict(options),
+                    "sync_converter": sync_converter,
+                }
+            )
+            return chunk_outputs[options["page_range"]]
+
+        with patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run):
+            result = await svc.convert_file(
+                str(tmp_pdf_file),
+                {"page_range": "0-5", "max_pages_per_chunk": 2, "force_ocr": True},
+            )
+
+        assert result == "# Chunk 1\n\n# Chunk 2\n\n# Chunk 3"
+        assert [call["options"]["page_range"] for call in calls] == ["0-1", "2-3", "4-5"]
+        assert all(call["options"]["force_ocr"] is True for call in calls)
+        assert all("max_pages_per_chunk" not in call["options"] for call in calls)
+        assert all(call["sync_converter"] is svc._convert_sync for call in calls)
+
+    async def test_convert_file_result_merges_chunked_structured_payloads(self, tmp_pdf_file):
+        chunk_results = {
+            "0-1": {
+                "text": "# Chunk 1",
+                "metadata": {"page_count": 2, "title": "Long PDF"},
+                "warnings": ["chunk-1 warning"],
+                "assets": {
+                    "images": [
+                        {"filename": "page-1.png", "path": "artifacts/images/page-1.png"},
+                    ]
+                },
+            },
+            "2-3": {
+                "text": "# Chunk 2",
+                "metadata": {"page_count": 2, "author": "Ada"},
+                "warnings": ["chunk-2 warning"],
+                "assets": {
+                    "images": [
+                        {"filename": "page-3.png", "path": "artifacts/images/page-3.png"},
+                    ],
+                    "attachments": [
+                        {"filename": "table.csv", "path": "artifacts/files/table.csv"},
+                    ],
+                },
+            },
+        }
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None):
+            return chunk_results[options["page_range"]]
+
+        with (
+            patch("marker_mcp.conversion_service._get_pdf_page_count", return_value=4, create=True),
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+        ):
+            result = await svc.convert_file_result(
+                str(tmp_pdf_file),
+                {"max_pages_per_chunk": 2},
+            )
+
+        assert result == {
+            "text": "# Chunk 1\n\n# Chunk 2",
+            "metadata": {
+                "page_count": 4,
+                "title": "Long PDF",
+                "author": "Ada",
+            },
+            "warnings": ["chunk-1 warning", "chunk-2 warning"],
+            "assets": {
+                "images": [
+                    {"filename": "page-1.png", "path": "artifacts/images/page-1.png"},
+                    {"filename": "page-3.png", "path": "artifacts/images/page-3.png"},
+                ],
+                "attachments": [
+                    {"filename": "table.csv", "path": "artifacts/files/table.csv"},
+                ],
+            },
+        }
+
+
+class TestStructuredFigureExport:
+    async def test_convert_file_result_serializes_marker_figures_into_assets(self, tmp_pdf_file):
+        figure = _make_test_figure()
+        markdown = "![Figure](_page_0_Picture_2.jpeg)"
+
+        with (
+            patch("marker_mcp.conversion_service._build_converter") as mock_build,
+            patch(
+                "marker_mcp.conversion_service.text_from_rendered",
+                return_value=(
+                    markdown,
+                    {"page_count": 1, "title": "Figure doc"},
+                    {"_page_0_Picture_2.jpeg": figure},
+                ),
+            ),
+        ):
+            mock_build.return_value = MagicMock(return_value=MagicMock())
+            result = await svc.convert_file_result(str(tmp_pdf_file))
+
+        assert result["text"] == markdown
+        assert result["metadata"] == {"page_count": 1, "title": "Figure doc"}
+        assert "_page_0_Picture_2.jpeg" not in result["metadata"]
+
+        [asset] = result["assets"]["images"]
+        assert asset["filename"] == "_page_0_Picture_2.jpeg"
+        assert asset.get("path", "").endswith("_page_0_Picture_2.jpeg") or "content_base64" in asset
+        if "content_base64" in asset:
+            assert base64.b64decode(asset["content_base64"])
+
+        assert json.loads(json.dumps(result)) == result

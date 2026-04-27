@@ -2,10 +2,11 @@
 
 import base64
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastmcp import Client
+from PIL import Image
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -63,18 +64,24 @@ class TestListTools:
         async with Client(_current_mcp()) as client:
             tools = await client.list_tools()
         names = {t.name for t in tools}
-        assert names == {
+        assert {
             "convert_document",
             "convert_document_from_content",
             "convert_documents_batch",
             "get_converter_status",
-        }
+        } <= names
 
     async def test_tools_have_descriptions(self):
         async with Client(_current_mcp()) as client:
             tools = await client.list_tools()
         for tool in tools:
             assert tool.description, f"Tool '{tool.name}' has no description"
+
+    async def test_structured_result_tool_registered(self):
+        async with Client(_current_mcp()) as client:
+            tools = await client.list_tools()
+        names = {t.name for t in tools}
+        assert "convert_document_result" in names
 
 
 # ---------------------------------------------------------------------------
@@ -105,6 +112,80 @@ class TestConvertDocument:
             await _call("convert_document", filepath=str(tmp_pdf_file), force_ocr=True)
         opts = mock_cf.call_args[0][1]
         assert opts.get("force_ocr") is True
+
+    async def test_max_pages_per_chunk_forwarded(self, tmp_pdf_file):
+        with patch("marker_mcp.conversion_service.convert_file", return_value="ok") as mock_cf:
+            await _call("convert_document", filepath=str(tmp_pdf_file), max_pages_per_chunk=8)
+        opts = mock_cf.call_args[0][1]
+        assert opts["max_pages_per_chunk"] == 8
+
+
+class TestConvertDocumentResult:
+    async def test_returns_text_metadata_and_asset_paths(self, tmp_pdf_file):
+        payload = {
+            "text": "# Result",
+            "metadata": {"page_count": 1},
+            "warnings": [],
+            "assets": {
+                "images": [
+                    {
+                        "filename": "page-1.png",
+                        "path": "artifacts/images/page-1.png",
+                    }
+                ]
+            },
+        }
+
+        with patch(
+            "marker_mcp.conversion_service.convert_file_result",
+            return_value=payload,
+            create=True,
+        ) as mock_result:
+            text = await _call("convert_document_result", filepath=str(tmp_pdf_file))
+
+        assert json.loads(text) == payload
+        mock_result.assert_called_once()
+
+    async def test_max_pages_per_chunk_forwarded(self, tmp_pdf_file):
+        payload = {
+            "text": "# Result",
+            "metadata": {},
+            "warnings": [],
+            "assets": {},
+        }
+
+        with patch(
+            "marker_mcp.conversion_service.convert_file_result",
+            return_value=payload,
+            create=True,
+        ) as mock_result:
+            await _call("convert_document_result", filepath=str(tmp_pdf_file), max_pages_per_chunk=8)
+
+        opts = mock_result.call_args[0][1]
+        assert opts["max_pages_per_chunk"] == 8
+
+    async def test_exports_marker_figures_as_serializable_assets(self, tmp_pdf_file):
+        markdown = "![Figure](_page_0_Picture_2.jpeg)"
+
+        with (
+            patch("marker_mcp.conversion_service._build_converter") as mock_build,
+            patch(
+                "marker_mcp.conversion_service.text_from_rendered",
+                return_value=(
+                    markdown,
+                    {"page_count": 1},
+                    {"_page_0_Picture_2.jpeg": Image.new("RGB", (2, 2), color="white")},
+                ),
+            ),
+        ):
+            mock_build.return_value = MagicMock(return_value=MagicMock())
+            text = await _call("convert_document_result", filepath=str(tmp_pdf_file))
+
+        data = json.loads(text)
+        assert data["metadata"] == {"page_count": 1}
+        [asset] = data["assets"]["images"]
+        assert asset["filename"] == "_page_0_Picture_2.jpeg"
+        assert asset.get("path", "").endswith("_page_0_Picture_2.jpeg") or "content_base64" in asset
 
 
 # ---------------------------------------------------------------------------

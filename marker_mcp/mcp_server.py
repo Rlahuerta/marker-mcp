@@ -19,24 +19,36 @@ import sys
 
 import click
 from fastmcp import FastMCP
+import marker_mcp.conversion_service as svc
 
 mcp = FastMCP(name="Marker Document Conversion Service")
 
 
 def _conversion_service():
-    import marker_mcp.conversion_service as svc
-
     return svc
 
 
 def _configure_ocr_device(ocr_device: str | None) -> None:
     """Apply the OCR device selector before the conversion service is used."""
-    if ocr_device is None:
-        return
+    _configure_runtime_overrides(ocr_device=ocr_device)
 
-    os.environ["MARKER_MCP_OCR_DEVICE"] = ocr_device
 
-    if "marker_mcp.conversion_service" in sys.modules:
+def _configure_runtime_overrides(
+    ocr_device: str | None = None,
+    model_dtype: str | None = None,
+) -> None:
+    """Apply startup-only conversion-service overrides and reload lazily."""
+    should_reload = False
+
+    if ocr_device is not None:
+        os.environ["MARKER_MCP_OCR_DEVICE"] = ocr_device
+        should_reload = True
+
+    if model_dtype is not None:
+        os.environ["MARKER_MCP_MODEL_DTYPE"] = model_dtype
+        should_reload = True
+
+    if should_reload and "marker_mcp.conversion_service" in sys.modules:
         importlib.reload(sys.modules["marker_mcp.conversion_service"])
 
 
@@ -49,6 +61,7 @@ async def convert_document(
     filepath: str,
     output_format: str = "markdown",
     page_range: str | None = None,
+    max_pages_per_chunk: int | None = None,
     force_ocr: bool = False,
     paginate_output: bool = False,
     use_llm: bool = False,
@@ -62,12 +75,42 @@ async def convert_document(
         filepath: Absolute or relative path to the document file.
         output_format: Output format — "markdown" (default), "json", "html", or "chunks".
         page_range: Page range to convert, e.g. "0,5-10,20". Null converts all pages.
+        max_pages_per_chunk: Optional PDF chunk size for sequential page-range batching.
         force_ocr: Force OCR on all pages even if a text layer exists.
         paginate_output: Separate pages with horizontal rules containing page numbers.
         use_llm: Use an LLM for higher accuracy (requires GOOGLE_API_KEY or compatible service).
     """
-    options = _build_options(output_format, page_range, force_ocr, paginate_output, use_llm)
+    options = _build_options(
+        output_format,
+        page_range,
+        force_ocr,
+        paginate_output,
+        use_llm,
+        max_pages_per_chunk=max_pages_per_chunk,
+    )
     return await _conversion_service().convert_file(filepath, options)
+
+
+@mcp.tool
+async def convert_document_result(
+    filepath: str,
+    output_format: str = "markdown",
+    page_range: str | None = None,
+    max_pages_per_chunk: int | None = None,
+    force_ocr: bool = False,
+    paginate_output: bool = False,
+    use_llm: bool = False,
+) -> dict:
+    """Convert a document and return text plus structured metadata and warnings."""
+    options = _build_options(
+        output_format,
+        page_range,
+        force_ocr,
+        paginate_output,
+        use_llm,
+        max_pages_per_chunk=max_pages_per_chunk,
+    )
+    return await _conversion_service().convert_file_result(filepath, options)
 
 
 @mcp.tool
@@ -76,6 +119,7 @@ async def convert_document_from_content(
     filename: str,
     output_format: str = "markdown",
     page_range: str | None = None,
+    max_pages_per_chunk: int | None = None,
     force_ocr: bool = False,
     paginate_output: bool = False,
     use_llm: bool = False,
@@ -89,11 +133,19 @@ async def convert_document_from_content(
         filename: Original filename including extension, e.g. "report.pdf".
         output_format: Output format — "markdown", "json", "html", or "chunks".
         page_range: Page range, e.g. "0,5-10,20". Null for all pages.
+        max_pages_per_chunk: Optional PDF chunk size for sequential page-range batching.
         force_ocr: Force OCR on all pages.
         paginate_output: Separate pages with horizontal rules.
         use_llm: Use LLM for higher accuracy.
     """
-    options = _build_options(output_format, page_range, force_ocr, paginate_output, use_llm)
+    options = _build_options(
+        output_format,
+        page_range,
+        force_ocr,
+        paginate_output,
+        use_llm,
+        max_pages_per_chunk=max_pages_per_chunk,
+    )
     content = _b64.b64decode(content_base64)
     return await _conversion_service().convert_bytes(content, filename, options)
 
@@ -147,10 +199,13 @@ def _build_options(
     force_ocr: bool,
     paginate_output: bool,
     use_llm: bool,
+    max_pages_per_chunk: int | None = None,
 ) -> dict:
     opts: dict = {"output_format": output_format}
     if page_range:
         opts["page_range"] = page_range
+    if max_pages_per_chunk is not None:
+        opts["max_pages_per_chunk"] = max_pages_per_chunk
     if force_ocr:
         opts["force_ocr"] = True
     if paginate_output:
@@ -196,9 +251,21 @@ def _build_options(
         "Use 'cpu' for a CPU-only OCR path and 'amd'/'rocm' for ROCm-backed PyTorch."
     ),
 )
-def mcp_server_cli(transport: str, host: str, port: int, ocr_device: str | None) -> None:
+@click.option(
+    "--model-dtype",
+    default=None,
+    type=click.Choice(["float16", "float32", "bfloat16"]),
+    help="Experimental Marker model dtype override used when loading local models.",
+)
+def mcp_server_cli(
+    transport: str,
+    host: str,
+    port: int,
+    ocr_device: str | None,
+    model_dtype: str | None,
+) -> None:
     """Start the Marker MCP server."""
-    _configure_ocr_device(ocr_device)
+    _configure_runtime_overrides(ocr_device=ocr_device, model_dtype=model_dtype)
     if transport == "stdio":
         mcp.run(transport="stdio")
     else:

@@ -127,6 +127,25 @@ class TestMcpServerCli:
         assert server.os.environ["MARKER_MCP_OCR_DEVICE"] == "cpu"
         mock_reload.assert_called_once()
         mock_run.assert_called_once_with(transport="stdio")
+
+    def test_model_dtype_sets_env_and_reloads_service(self, monkeypatch):
+        runner = CliRunner()
+        monkeypatch.delenv("MARKER_MCP_MODEL_DTYPE", raising=False)
+
+        with (
+            patch.object(server.mcp, "run") as mock_run,
+            patch("importlib.reload") as mock_reload,
+        ):
+            result = runner.invoke(
+                server.mcp_server_cli,
+                ["--transport", "stdio", "--model-dtype", "bfloat16"],
+            )
+
+        assert result.exit_code == 0
+        assert server.os.environ["MARKER_MCP_MODEL_DTYPE"] == "bfloat16"
+        mock_reload.assert_called_once()
+        mock_run.assert_called_once_with(transport="stdio")
+
     def test_main_guard_invokes_click_command(self):
         existing = sys.modules.pop("marker_mcp.mcp_server", None)
         try:

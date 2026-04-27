@@ -9,6 +9,7 @@ dependencies = [
     "fastmcp>=2.0.0",
     "marker-pdf[full]",
     "click>=8.0.0",
+    "pypdf>=5.0.0",
 ]
 
 [project.scripts]
