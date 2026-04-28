@@ -62,6 +62,8 @@ async def convert_document(
     output_format: str = "markdown",
     page_range: str | None = None,
     max_pages_per_chunk: int | None = None,
+    max_page_height_px: int | None = None,
+    gpu_memory_profile: str | None = None,
     force_ocr: bool = False,
     paginate_output: bool = False,
     use_llm: bool = False,
@@ -76,6 +78,8 @@ async def convert_document(
         output_format: Output format — "markdown" (default), "json", "html", or "chunks".
         page_range: Page range to convert, e.g. "0,5-10,20". Null converts all pages.
         max_pages_per_chunk: Optional PDF chunk size for sequential page-range batching.
+        max_page_height_px: Experimental PDF page-strip height for rasterized per-page tiling.
+        gpu_memory_profile: Optional GPU memory tuning profile, e.g. "low-vram".
         force_ocr: Force OCR on all pages even if a text layer exists.
         paginate_output: Separate pages with horizontal rules containing page numbers.
         use_llm: Use an LLM for higher accuracy (requires GOOGLE_API_KEY or compatible service).
@@ -87,6 +91,8 @@ async def convert_document(
         paginate_output,
         use_llm,
         max_pages_per_chunk=max_pages_per_chunk,
+        max_page_height_px=max_page_height_px,
+        gpu_memory_profile=gpu_memory_profile,
     )
     return await _conversion_service().convert_file(filepath, options)
 
@@ -97,6 +103,8 @@ async def convert_document_result(
     output_format: str = "markdown",
     page_range: str | None = None,
     max_pages_per_chunk: int | None = None,
+    max_page_height_px: int | None = None,
+    gpu_memory_profile: str | None = None,
     force_ocr: bool = False,
     paginate_output: bool = False,
     use_llm: bool = False,
@@ -109,6 +117,8 @@ async def convert_document_result(
         paginate_output,
         use_llm,
         max_pages_per_chunk=max_pages_per_chunk,
+        max_page_height_px=max_page_height_px,
+        gpu_memory_profile=gpu_memory_profile,
     )
     return await _conversion_service().convert_file_result(filepath, options)
 
@@ -120,6 +130,8 @@ async def convert_document_from_content(
     output_format: str = "markdown",
     page_range: str | None = None,
     max_pages_per_chunk: int | None = None,
+    max_page_height_px: int | None = None,
+    gpu_memory_profile: str | None = None,
     force_ocr: bool = False,
     paginate_output: bool = False,
     use_llm: bool = False,
@@ -134,6 +146,8 @@ async def convert_document_from_content(
         output_format: Output format — "markdown", "json", "html", or "chunks".
         page_range: Page range, e.g. "0,5-10,20". Null for all pages.
         max_pages_per_chunk: Optional PDF chunk size for sequential page-range batching.
+        max_page_height_px: Experimental PDF page-strip height for rasterized per-page tiling.
+        gpu_memory_profile: Optional GPU memory tuning profile, e.g. "low-vram".
         force_ocr: Force OCR on all pages.
         paginate_output: Separate pages with horizontal rules.
         use_llm: Use LLM for higher accuracy.
@@ -145,6 +159,8 @@ async def convert_document_from_content(
         paginate_output,
         use_llm,
         max_pages_per_chunk=max_pages_per_chunk,
+        max_page_height_px=max_page_height_px,
+        gpu_memory_profile=gpu_memory_profile,
     )
     content = _b64.b64decode(content_base64)
     return await _conversion_service().convert_bytes(content, filename, options)
@@ -200,12 +216,18 @@ def _build_options(
     paginate_output: bool,
     use_llm: bool,
     max_pages_per_chunk: int | None = None,
+    max_page_height_px: int | None = None,
+    gpu_memory_profile: str | None = None,
 ) -> dict:
     opts: dict = {"output_format": output_format}
     if page_range:
         opts["page_range"] = page_range
     if max_pages_per_chunk is not None:
         opts["max_pages_per_chunk"] = max_pages_per_chunk
+    if max_page_height_px is not None:
+        opts["max_page_height_px"] = max_page_height_px
+    if gpu_memory_profile:
+        opts["gpu_memory_profile"] = gpu_memory_profile
     if force_ocr:
         opts["force_ocr"] = True
     if paginate_output:

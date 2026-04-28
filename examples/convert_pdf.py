@@ -27,6 +27,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sequential PDF chunk size used to reduce peak memory pressure.",
     )
     parser.add_argument(
+        "--max-page-height-px",
+        type=int,
+        default=None,
+        help="Experimental rasterized page-strip height used to split large PDF pages vertically.",
+    )
+    parser.add_argument(
+        "--gpu-memory-profile",
+        choices=["low-vram"],
+        default=None,
+        help="Optional GPU memory tuning profile that lowers Marker batch sizes while staying on GPU.",
+    )
+    parser.add_argument(
         "--ocr-device",
         choices=["auto", "cpu", "cuda", "nvidia", "amd", "rocm", "mps"],
         default=None,
@@ -71,6 +83,10 @@ def build_options(args: argparse.Namespace) -> dict:
         options["page_range"] = args.page_range
     if args.max_pages_per_chunk is not None:
         options["max_pages_per_chunk"] = args.max_pages_per_chunk
+    if args.max_page_height_px is not None:
+        options["max_page_height_px"] = args.max_page_height_px
+    if args.gpu_memory_profile is not None:
+        options["gpu_memory_profile"] = args.gpu_memory_profile
     if args.use_llm:
         options["use_llm"] = True
     return options
@@ -153,6 +169,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    #  python convert_pdf.py s00466-025-02696-0.pdf --page-range 0-1 --ocr-device "cuda" --max-pages-per-chunk 2 -o s00466-025-02696-0-sample.md
+    #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-5 --ocr-device "cuda" --model-dtype "float16" --max-pages-per-chunk 1 -o risks-13-00247-v2.md
+    #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-10 --ocr-device "cuda" --model-dtype "float16" --gpu-memory-profile low-vram --max-pages-per-chunk 1 -o risks-13-00247-v2.md
+    #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-10 --ocr-device "cuda" --max-page-height-px 300 -o risks-13-00247-v2.md
 
     main()

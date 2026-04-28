@@ -69,6 +69,21 @@ class TestBuildOptions:
             "paginate_output": True,
         }
 
+    def test_max_page_height_px_included_when_set(self, clean_llm_env):
+        opts = _build_options("markdown", None, False, False, False, max_page_height_px=1600)
+        assert opts["max_page_height_px"] == 1600
+
+    def test_gpu_memory_profile_included_when_set(self, clean_llm_env):
+        opts = _build_options(
+            "markdown",
+            None,
+            False,
+            False,
+            False,
+            gpu_memory_profile="low-vram",
+        )
+        assert opts["gpu_memory_profile"] == "low-vram"
+
 
 class TestGetStatus:
     def test_ready_when_models_loaded(self):

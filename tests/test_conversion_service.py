@@ -7,7 +7,7 @@ import json
 import os
 import sys
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
 from PIL import Image
@@ -76,7 +76,7 @@ class TestOcrDeviceOverride:
 # ---------------------------------------------------------------------------
 
 class TestBuildConverter:
-    def test_builds_pdf_converter_with_config_parser_outputs(self):
+    def test_builds_pdf_converter_with_default_pdftext_workers(self):
         parser = MagicMock()
         parser.generate_config_dict.return_value = {"output_format": "json"}
         parser.get_processors.return_value = ["proc"]
@@ -92,7 +92,63 @@ class TestBuildConverter:
         assert result == "converter"
         mock_parser_cls.assert_called_once_with({"output_format": "json"})
         mock_pdf_converter.assert_called_once_with(
-            config={"output_format": "json", "pdftext_workers": 1},
+            config={"output_format": "json", "pdftext_workers": 8},
+            artifact_dict=svc._MODELS,
+            processor_list=["proc"],
+            renderer="renderer",
+            llm_service="llm",
+        )
+
+    def test_preserves_explicit_pdftext_workers(self):
+        parser = MagicMock()
+        parser.generate_config_dict.return_value = {"output_format": "json", "pdftext_workers": 3}
+        parser.get_processors.return_value = ["proc"]
+        parser.get_renderer.return_value = "renderer"
+        parser.get_llm_service.return_value = "llm"
+
+        with (
+            patch("marker_mcp.conversion_service.ConfigParser", return_value=parser),
+            patch("marker_mcp.conversion_service.PdfConverter", return_value="converter") as mock_pdf_converter,
+        ):
+            result = svc._build_converter({"output_format": "json", "pdftext_workers": 3})
+
+        assert result == "converter"
+        mock_pdf_converter.assert_called_once_with(
+            config={"output_format": "json", "pdftext_workers": 3},
+            artifact_dict=svc._MODELS,
+            processor_list=["proc"],
+            renderer="renderer",
+            llm_service="llm",
+        )
+
+    def test_applies_low_vram_gpu_profile_to_converter_config(self):
+        parser = MagicMock()
+        parser.generate_config_dict.return_value = {
+            "output_format": "json",
+            "gpu_memory_profile": "low-vram",
+        }
+        parser.get_processors.return_value = ["proc"]
+        parser.get_renderer.return_value = "renderer"
+        parser.get_llm_service.return_value = "llm"
+
+        with (
+            patch("marker_mcp.conversion_service.ConfigParser", return_value=parser),
+            patch("marker_mcp.conversion_service.PdfConverter", return_value="converter") as mock_pdf_converter,
+        ):
+            result = svc._build_converter({"output_format": "json", "gpu_memory_profile": "low-vram"})
+
+        assert result == "converter"
+        mock_pdf_converter.assert_called_once_with(
+            config={
+                "output_format": "json",
+                "layout_batch_size": 2,
+                "detection_batch_size": 1,
+                "recognition_batch_size": 16,
+                "ocr_error_batch_size": 4,
+                "table_rec_batch_size": 4,
+                "equation_batch_size": 4,
+                "pdftext_workers": 8,
+            },
             artifact_dict=svc._MODELS,
             processor_list=["proc"],
             renderer="renderer",
@@ -149,6 +205,7 @@ class TestConvertFile:
     async def test_retries_with_cpu_when_cuda_oom(self, tmp_pdf_file, monkeypatch):
         original_models = {"device": "cuda"}
         cpu_models = {"device": "cpu"}
+        restored_models = {"device": "cuda-restored"}
         svc._MODELS = original_models
         seen_attempts: list[tuple[str | None, dict]] = []
 
@@ -162,14 +219,17 @@ class TestConvertFile:
 
         with (
             patch("marker_mcp.conversion_service._convert_sync", side_effect=fake_convert),
-            patch("marker_mcp.conversion_service._create_models", return_value=cpu_models) as mock_create,
+            patch(
+                "marker_mcp.conversion_service._create_models",
+                side_effect=[cpu_models, restored_models],
+            ) as mock_create,
         ):
             result = await svc.convert_file(str(tmp_pdf_file))
 
         assert result == "# CPU fallback output"
         assert seen_attempts == [(None, original_models), ("cpu", cpu_models)]
-        mock_create.assert_called_once_with(device="cpu")
-        assert svc._MODELS is cpu_models
+        assert mock_create.call_args_list == [call(device="cpu"), call(device=None)]
+        assert svc._MODELS is restored_models
 
     async def test_warns_and_falls_back_when_llm_conversion_fails(self, tmp_pdf_file):
         attempts: list[dict] = []
@@ -187,6 +247,28 @@ class TestConvertFile:
         assert result == "# Fallback output"
         assert attempts[0]["use_llm"] is True
         assert "use_llm" not in attempts[1]
+
+    async def test_run_conversion_with_fallbacks_releases_memory_after_success(self, tmp_pdf_file):
+        def fake_convert(filepath, options):
+            return "# ok"
+
+        with patch("marker_mcp.conversion_service._release_torch_memory") as mock_release:
+            result = await svc._run_conversion_with_fallbacks(str(tmp_pdf_file), {}, fake_convert)
+
+        assert result == "# ok"
+        mock_release.assert_called_once()
+
+    async def test_uses_page_tiling_when_max_page_height_px_set(self, tmp_pdf_file):
+        payload = {"text": "# Tiled", "metadata": {}, "warnings": [], "assets": {}}
+
+        with patch(
+            "marker_mcp.conversion_service._convert_file_with_page_tiling",
+            new=AsyncMock(return_value=payload),
+        ) as mock_tiled:
+            result = await svc.convert_file(str(tmp_pdf_file), {"max_page_height_px": 1600})
+
+        assert result == "# Tiled"
+        mock_tiled.assert_awaited_once()
 
 
 # ---------------------------------------------------------------------------
@@ -376,6 +458,13 @@ class TestChunkHelpers:
             "8-8",
         ]
 
+    def test_tile_vertical_bounds_for_large_pages(self):
+        assert svc._tile_vertical_bounds(height=900, max_tile_height=400, overlap_px=96) == [
+            (0, 400),
+            (304, 704),
+            (608, 900),
+        ]
+
     def test_parse_and_chunk_explicit_page_range(self):
         assert svc._parse_page_range("0,2,4-6") == [0, 2, 4, 5, 6]
         assert svc._chunk_requested_page_range("0,2,4-6", max_pages_per_chunk=2) == [
@@ -384,10 +473,22 @@ class TestChunkHelpers:
             "6",
         ]
 
+    def test_merge_tiled_texts_trims_duplicate_overlap_lines(self):
+        assert svc._merge_tiled_texts(
+            [
+                "# Page 1\nShared line",
+                "Shared line\nContinuation",
+                "Continuation\nFinal line",
+            ]
+        ) == "# Page 1\nShared line\n\nContinuation\n\nFinal line"
+
     def test_merge_chunk_texts_preserves_chunk_order(self):
         assert svc._merge_chunk_texts(["# Chunk 1", "# Chunk 2", "# Chunk 3"]) == (
             "# Chunk 1\n\n# Chunk 2\n\n# Chunk 3"
         )
+
+    def test_gpu_oom_tile_height_attempts_descend_to_floor(self):
+        assert svc._gpu_oom_tile_height_attempts() == [1600, 800, 400]
 
 
 class TestChunkedConversionOrchestration:
@@ -399,7 +500,7 @@ class TestChunkedConversionOrchestration:
             "4-4": "# Chunk 3",
         }
 
-        async def fake_run(filepath, options, sync_converter, warnings_list=None):
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
             calls.append(
                 {
                     "filepath": filepath,
@@ -424,6 +525,23 @@ class TestChunkedConversionOrchestration:
         assert all(call["options"]["force_ocr"] is True for call in calls)
         assert all("max_pages_per_chunk" not in call["options"] for call in calls)
         assert all(call["sync_converter"] is svc._convert_sync for call in calls)
+
+    async def test_convert_file_in_chunks_releases_memory_between_chunks(self, tmp_pdf_file):
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            return f"# {options['page_range']}"
+
+        with (
+            patch("marker_mcp.conversion_service._get_pdf_page_count", return_value=5, create=True),
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+            patch("marker_mcp.conversion_service._release_torch_memory") as mock_release,
+        ):
+            await svc._convert_file_in_chunks(
+                str(tmp_pdf_file),
+                {"max_pages_per_chunk": 2},
+                svc._convert_sync,
+            )
+
+        assert mock_release.call_count == 3
 
     async def test_convert_file_chunks_explicit_page_range_when_max_pages_per_chunk_set(self, tmp_pdf_file):
         calls: list[dict] = []
@@ -454,6 +572,141 @@ class TestChunkedConversionOrchestration:
         assert all(call["options"]["force_ocr"] is True for call in calls)
         assert all("max_pages_per_chunk" not in call["options"] for call in calls)
         assert all(call["sync_converter"] is svc._convert_sync for call in calls)
+
+    async def test_single_page_chunk_uses_gpu_tiling_before_cpu_fallback(self, tmp_pdf_file):
+        chunk_outputs = {
+            "1": {
+                "text": "# Page 2 via tiling",
+                "metadata": {"page_count": 1},
+                "warnings": [],
+                "assets": {},
+            },
+            "2": {
+                "text": "# Page 3",
+                "metadata": {"page_count": 1},
+                "warnings": [],
+                "assets": {},
+            },
+        }
+        run_calls: list[dict] = []
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            run_calls.append(
+                {
+                    "page_range": options.get("page_range"),
+                    "gpu_memory_profile": options.get("gpu_memory_profile"),
+                    "allow_cpu_fallback": allow_cpu_fallback,
+                }
+            )
+            if options.get("page_range") == "1" and allow_cpu_fallback is False:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return chunk_outputs[options["page_range"]]
+
+        tiled_payload = {
+            "text": "# Page 2 via tiling",
+            "metadata": {"page_count": 1},
+            "warnings": [],
+            "assets": {},
+        }
+
+        with (
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+            patch(
+                "marker_mcp.conversion_service._convert_file_with_page_tiling",
+                new=AsyncMock(return_value=tiled_payload),
+            ) as mock_tiling,
+        ):
+            result = await svc.convert_file_result(
+                str(tmp_pdf_file),
+                {"page_range": "1-2", "max_pages_per_chunk": 1},
+            )
+
+        assert result["text"] == "# Page 2 via tiling\n\n# Page 3"
+        assert result["metadata"]["page_count"] == 2
+        assert run_calls == [
+            {"page_range": "1", "gpu_memory_profile": None, "allow_cpu_fallback": False},
+            {"page_range": "1", "gpu_memory_profile": "low-vram", "allow_cpu_fallback": False},
+            {"page_range": "2", "gpu_memory_profile": None, "allow_cpu_fallback": False},
+        ]
+        mock_tiling.assert_awaited_once()
+
+    async def test_single_page_chunk_persists_low_vram_gpu_profile_after_success(self, tmp_pdf_file):
+        run_calls: list[dict] = []
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            run_calls.append(
+                {
+                    "page_range": options.get("page_range"),
+                    "gpu_memory_profile": options.get("gpu_memory_profile"),
+                    "allow_cpu_fallback": allow_cpu_fallback,
+                }
+            )
+            if options.get("page_range") == "1" and options.get("gpu_memory_profile") is None:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return {
+                "text": f"# Page {options['page_range']}",
+                "metadata": {"page_count": 1},
+                "warnings": [],
+                "assets": {},
+            }
+
+        with (
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+            patch(
+                "marker_mcp.conversion_service._convert_file_with_page_tiling",
+                new=AsyncMock(),
+            ) as mock_tiling,
+        ):
+            result = await svc.convert_file_result(
+                str(tmp_pdf_file),
+                {"page_range": "1-2", "max_pages_per_chunk": 1},
+            )
+
+        assert result["text"] == "# Page 1\n\n# Page 2"
+        assert result["metadata"]["page_count"] == 2
+        assert run_calls == [
+            {"page_range": "1", "gpu_memory_profile": None, "allow_cpu_fallback": False},
+            {"page_range": "1", "gpu_memory_profile": "low-vram", "allow_cpu_fallback": False},
+            {"page_range": "2", "gpu_memory_profile": "low-vram", "allow_cpu_fallback": False},
+        ]
+        mock_tiling.assert_not_awaited()
+
+    async def test_single_page_chunk_retries_smaller_gpu_tiles_before_cpu(self, tmp_pdf_file):
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            if allow_cpu_fallback is False:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return {
+                "text": "# CPU fallback",
+                "metadata": {"page_count": 1},
+                "warnings": [],
+                "assets": {},
+            }
+
+        tiling_calls: list[int] = []
+
+        async def fake_tiling(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            tiling_calls.append(options["max_page_height_px"])
+            if options["max_page_height_px"] == 1600:
+                raise RuntimeError("CUDA out of memory while allocating tensor")
+            return {
+                "text": "# Page via smaller tiling",
+                "metadata": {"page_count": 1},
+                "warnings": [],
+                "assets": {},
+            }
+
+        with (
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+            patch("marker_mcp.conversion_service._convert_file_with_page_tiling", side_effect=fake_tiling),
+        ):
+            result = await svc.convert_file_result(
+                str(tmp_pdf_file),
+                {"page_range": "1", "max_pages_per_chunk": 1},
+            )
+
+        assert result["text"] == "# Page via smaller tiling"
+        assert result["metadata"]["page_count"] == 1
+        assert tiling_calls == [1600, 800]
 
     async def test_convert_file_result_merges_chunked_structured_payloads(self, tmp_pdf_file):
         chunk_results = {
@@ -512,6 +765,54 @@ class TestChunkedConversionOrchestration:
                 ],
             },
         }
+
+
+class TestPageTilingOrchestration:
+    async def test_convert_file_result_uses_page_tiling_when_configured(self, tmp_pdf_file):
+        payload = {
+            "text": "# Tiled",
+            "metadata": {"page_count": 2},
+            "warnings": [],
+            "assets": {},
+        }
+
+        with patch(
+            "marker_mcp.conversion_service._convert_file_with_page_tiling",
+            new=AsyncMock(return_value=payload),
+        ) as mock_tiled:
+            result = await svc.convert_file_result(str(tmp_pdf_file), {"max_page_height_px": 1600})
+
+        assert result["text"] == "# Tiled"
+        assert result["metadata"]["page_count"] == 2
+        mock_tiled.assert_awaited_once()
+
+    async def test_convert_file_with_page_tiling_releases_memory_between_tiles(self, tmp_pdf_file):
+        tile_result = {
+            "text": "# Tile",
+            "metadata": {},
+            "warnings": [],
+            "assets": {},
+        }
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            return tile_result
+
+        with (
+            patch(
+                "marker_mcp.conversion_service._render_pdf_page_image",
+                return_value=Image.new("RGB", (400, 900), color="white"),
+            ),
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+            patch("marker_mcp.conversion_service._release_torch_memory") as mock_release,
+        ):
+            result = await svc._convert_file_with_page_tiling(
+                str(tmp_pdf_file),
+                {"page_range": "0", "max_page_height_px": 400},
+                svc._convert_sync_result,
+            )
+
+        assert result["metadata"]["page_count"] == 1
+        assert mock_release.call_count == 4
 
 
 class TestStructuredFigureExport:

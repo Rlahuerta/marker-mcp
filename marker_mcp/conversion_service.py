@@ -23,6 +23,22 @@ from typing import Any, Optional
 
 _AUTO_DEVICE_SENTINEL = "__auto__"
 _MODEL_DTYPE_CHOICES = {"float16", "float32", "bfloat16"}
+_GPU_MEMORY_PROFILE_CHOICES = {"low-vram"}
+_DEFAULT_PAGE_TILE_OVERLAP_PX = 96
+_PAGE_TILE_RENDER_DPI = 192
+_DEFAULT_GPU_OOM_TILE_HEIGHT_PX = 1600
+_DEFAULT_PDFTEXT_WORKERS = 8
+_LOW_VRAM_GPU_CONFIG = {
+    "layout_batch_size": 2,
+    "detection_batch_size": 1,
+    "recognition_batch_size": 16,
+    "ocr_error_batch_size": 4,
+    "table_rec_batch_size": 4,
+    "equation_batch_size": 4,
+}
+_GPU_MEMORY_PROFILE_CONFIGS = {
+    "low-vram": _LOW_VRAM_GPU_CONFIG,
+}
 _OCR_DEVICE_ALIAS_MAP = {
     "auto": _AUTO_DEVICE_SENTINEL,
     "cpu": "cpu",
@@ -84,6 +100,25 @@ def _resolve_model_dtype_override(raw_value: str | None) -> str | None:
         supported = ", ".join(sorted(_MODEL_DTYPE_CHOICES))
         raise ValueError(
             f"Unsupported MARKER_MCP_MODEL_DTYPE={raw_value!r}. "
+            f"Expected one of: {supported}."
+        )
+
+    return normalized
+
+
+def _resolve_gpu_memory_profile(raw_value: str | None) -> str | None:
+    """Validate the optional GPU-memory profile used to tune Marker batch sizes."""
+    if raw_value is None:
+        return None
+
+    normalized = raw_value.strip().lower()
+    if not normalized:
+        return None
+
+    if normalized not in _GPU_MEMORY_PROFILE_CHOICES:
+        supported = ", ".join(sorted(_GPU_MEMORY_PROFILE_CHOICES))
+        raise ValueError(
+            f"Unsupported gpu_memory_profile={raw_value!r}. "
             f"Expected one of: {supported}."
         )
 
@@ -252,7 +287,12 @@ def _build_converter(options: dict) -> PdfConverter:
     """Build a configured PdfConverter from an options dict."""
     config_parser = ConfigParser(options)
     config_dict = config_parser.generate_config_dict()
-    config_dict["pdftext_workers"] = 1
+    gpu_memory_profile = _resolve_gpu_memory_profile(options.get("gpu_memory_profile"))
+    config_dict.pop("gpu_memory_profile", None)
+    if gpu_memory_profile is not None:
+        for key, value in _GPU_MEMORY_PROFILE_CONFIGS[gpu_memory_profile].items():
+            config_dict.setdefault(key, value)
+    config_dict.setdefault("pdftext_workers", _DEFAULT_PDFTEXT_WORKERS)
     return PdfConverter(
         config=config_dict,
         artifact_dict=_MODELS,
@@ -280,6 +320,17 @@ def _release_torch_memory() -> None:
 
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         torch.cuda.empty_cache()
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
+
+
+def _close_image(image: Any) -> None:
+    """Best-effort close for Pillow images created during tiling/rendering."""
+    close = getattr(image, "close", None)
+    if callable(close):
+        close()
 
 
 def _reload_models_for_device(device: str | None) -> None:
@@ -507,43 +558,202 @@ async def _run_conversion_with_fallbacks(
     options: dict,
     sync_converter,
     warnings_list: list[str] | None = None,
+    allow_cpu_fallback: bool = True,
 ):
     """Run a conversion attempt with explicit CUDA-OOM and optional-LLM fallbacks."""
     opts = dict(options)
     cpu_fallback_enabled = False
+    cpu_fallback_used = False
     llm_fallback_used = False
+    original_torch_device = os.environ.get("TORCH_DEVICE")
+    had_original_torch_device = "TORCH_DEVICE" in os.environ
 
-    while True:
-        context_manager = (
-            _temporary_torch_device("cpu") if cpu_fallback_enabled else contextlib.nullcontext()
+    try:
+        while True:
+            context_manager = (
+                _temporary_torch_device("cpu") if cpu_fallback_enabled else contextlib.nullcontext()
+            )
+            with context_manager:
+                try:
+                    return await asyncio.to_thread(sync_converter, filepath, opts)
+                except Exception as exc:
+                    if allow_cpu_fallback and not cpu_fallback_enabled and _is_cuda_oom_error(exc):
+                        cpu_fallback_enabled = True
+                        cpu_fallback_used = True
+                        warning_message = (
+                            "CUDA out-of-memory during Marker conversion; retrying this step on CPU."
+                        )
+                        if warnings_list is not None:
+                            warnings_list.append(warning_message)
+                        warnings.warn(warning_message, UserWarning, stacklevel=2)
+                        _reload_models_for_device("cpu")
+                        continue
+
+                    if opts.get("use_llm") and not llm_fallback_used and _is_llm_failure(exc):
+                        llm_fallback_used = True
+                        warning_message = (
+                            "LLM-assisted Marker conversion failed; retrying without LLM enhancements."
+                        )
+                        if warnings_list is not None:
+                            warnings_list.append(warning_message)
+                        warnings.warn(warning_message, UserWarning, stacklevel=2)
+                        opts = _without_llm_options(opts)
+                        continue
+
+                    raise
+                finally:
+                    _release_torch_memory()
+    finally:
+        if cpu_fallback_used and (had_original_torch_device or original_torch_device is None):
+            _reload_models_for_device(original_torch_device)
+
+
+def _is_single_page_pdf_step(filepath: str, options: dict) -> bool:
+    """Return True when the requested conversion step targets exactly one PDF page."""
+    if Path(filepath).suffix.lower() != ".pdf":
+        return False
+    page_range = options.get("page_range")
+    if not page_range:
+        return False
+    return len(_parse_page_range(page_range)) == 1
+
+
+def _gpu_oom_tile_height_attempts(initial_height: int = _DEFAULT_GPU_OOM_TILE_HEIGHT_PX) -> list[int]:
+    """Return descending GPU tile heights to try before falling back to CPU."""
+    attempts: list[int] = []
+    height = initial_height
+    while height >= 400:
+        attempts.append(height)
+        if height == 400:
+            break
+        height = max(400, height // 2)
+    return attempts
+
+
+def _gpu_memory_profile_retry_attempts(options: dict) -> list[str]:
+    """Return GPU-memory profiles to try before page tiling or CPU fallback."""
+    current_profile = _resolve_gpu_memory_profile(options.get("gpu_memory_profile"))
+    return [
+        profile
+        for profile in ("low-vram",)
+        if profile != current_profile
+    ]
+
+
+async def _run_conversion_with_gpu_memory_profile_recovery(
+    filepath: str,
+    options: dict,
+    sync_converter,
+    warnings_list: list[str] | None = None,
+    adaptive_options: dict | None = None,
+):
+    """Retry a failed GPU step with smaller Marker batch sizes before page tiling."""
+    for profile in _gpu_memory_profile_retry_attempts(options):
+        warning_message = (
+            "CUDA out-of-memory during single-page conversion; retrying with GPU memory "
+            f"profile '{profile}' before page tiling."
         )
-        with context_manager:
-            try:
-                return await asyncio.to_thread(sync_converter, filepath, opts)
-            except Exception as exc:
-                if not cpu_fallback_enabled and _is_cuda_oom_error(exc):
-                    cpu_fallback_enabled = True
-                    warning_message = (
-                        "CUDA out-of-memory during Marker conversion; retrying on CPU."
-                    )
-                    if warnings_list is not None:
-                        warnings_list.append(warning_message)
-                    warnings.warn(warning_message, UserWarning, stacklevel=2)
-                    _reload_models_for_device("cpu")
-                    continue
+        if warnings_list is not None:
+            warnings_list.append(warning_message)
+        warnings.warn(warning_message, UserWarning, stacklevel=2)
 
-                if opts.get("use_llm") and not llm_fallback_used and _is_llm_failure(exc):
-                    llm_fallback_used = True
-                    warning_message = (
-                        "LLM-assisted Marker conversion failed; retrying without LLM enhancements."
-                    )
-                    if warnings_list is not None:
-                        warnings_list.append(warning_message)
-                    warnings.warn(warning_message, UserWarning, stacklevel=2)
-                    opts = _without_llm_options(opts)
-                    continue
-
+        profiled_options = {**options, "gpu_memory_profile": profile}
+        try:
+            result = await _run_conversion_with_fallbacks(
+                filepath,
+                profiled_options,
+                sync_converter,
+                warnings_list=warnings_list,
+                allow_cpu_fallback=False,
+            )
+        except Exception as exc:
+            if not _is_cuda_oom_error(exc):
                 raise
+            continue
+
+        if adaptive_options is not None:
+            adaptive_options["gpu_memory_profile"] = profile
+        return result
+
+    return None
+
+
+async def _run_conversion_with_gpu_page_tiling_recovery(
+    filepath: str,
+    options: dict,
+    sync_converter,
+    warnings_list: list[str] | None = None,
+    adaptive_options: dict | None = None,
+):
+    """Prefer GPU page tiling over CPU fallback for single-page PDF OOMs."""
+    if options.get("max_page_height_px") is not None or not _is_single_page_pdf_step(filepath, options):
+        return await _run_conversion_with_fallbacks(
+            filepath,
+            options,
+            sync_converter,
+            warnings_list=warnings_list,
+        )
+
+    try:
+        return await _run_conversion_with_fallbacks(
+            filepath,
+            options,
+            sync_converter,
+            warnings_list=warnings_list,
+            allow_cpu_fallback=False,
+        )
+    except Exception as exc:
+        if not _is_cuda_oom_error(exc):
+            raise
+
+    profiled_result = await _run_conversion_with_gpu_memory_profile_recovery(
+        filepath,
+        options,
+        sync_converter,
+        warnings_list=warnings_list,
+        adaptive_options=adaptive_options,
+    )
+    if profiled_result is not None:
+        return profiled_result
+
+    for tile_height in _gpu_oom_tile_height_attempts():
+        warning_message = (
+            "CUDA out-of-memory during single-page conversion; retrying with GPU page tiling "
+            f"({tile_height}px) before CPU fallback."
+        )
+        if warnings_list is not None:
+            warnings_list.append(warning_message)
+        warnings.warn(warning_message, UserWarning, stacklevel=2)
+
+        tiled_options = {**options, "max_page_height_px": tile_height}
+        try:
+            tiled_result = await _convert_file_with_page_tiling(
+                filepath,
+                tiled_options,
+                _convert_sync_result,
+                warnings_list=warnings_list,
+                allow_cpu_fallback=False,
+            )
+            if sync_converter is _convert_sync:
+                return str(tiled_result["text"])
+            return tiled_result
+        except Exception as tiled_exc:
+            if not _is_cuda_oom_error(tiled_exc):
+                raise
+
+    fallback_warning = (
+        "GPU page tiling also ran out of memory at all configured tile sizes; retrying the step on CPU."
+    )
+    if warnings_list is not None:
+        warnings_list.append(fallback_warning)
+    warnings.warn(fallback_warning, UserWarning, stacklevel=2)
+    return await _run_conversion_with_fallbacks(
+        filepath,
+        options,
+        sync_converter,
+        warnings_list=warnings_list,
+        allow_cpu_fallback=True,
+    )
 
 
 def _chunk_page_ranges(total_pages: int, max_pages_per_chunk: int) -> list[str]:
@@ -558,6 +768,14 @@ def _chunk_page_ranges(total_pages: int, max_pages_per_chunk: int) -> list[str]:
         end = min(start + max_pages_per_chunk - 1, total_pages - 1)
         ranges.append(f"{start}-{end}")
     return ranges
+
+
+def _requested_page_numbers(filepath: str, options: dict) -> list[int]:
+    """Return the ordered page numbers requested for a PDF conversion."""
+    page_range = options.get("page_range")
+    if page_range:
+        return _parse_page_range(page_range)
+    return list(range(_get_pdf_page_count(filepath)))
 
 
 def _parse_page_range(page_range: str) -> list[int]:
@@ -627,10 +845,112 @@ def _merge_chunk_texts(chunk_texts: list[str]) -> str:
     return "\n\n".join(text for text in chunk_texts if text)
 
 
+def _tile_vertical_bounds(
+    height: int,
+    max_tile_height: int,
+    overlap_px: int = _DEFAULT_PAGE_TILE_OVERLAP_PX,
+) -> list[tuple[int, int]]:
+    """Split an image height into overlapping vertical strips."""
+    if max_tile_height <= 0:
+        raise ValueError("max_page_height_px must be greater than zero.")
+    if overlap_px < 0:
+        raise ValueError("page tile overlap must be non-negative.")
+    if overlap_px >= max_tile_height:
+        raise ValueError("page tile overlap must be smaller than max_page_height_px.")
+    if height <= 0:
+        return []
+    if height <= max_tile_height:
+        return [(0, height)]
+
+    bounds: list[tuple[int, int]] = []
+    top = 0
+    while top < height:
+        bottom = min(top + max_tile_height, height)
+        bounds.append((top, bottom))
+        if bottom >= height:
+            break
+        top = bottom - overlap_px
+    return bounds
+
+
+def _tile_page_image(
+    image: Any,
+    max_tile_height: int,
+    overlap_px: int = _DEFAULT_PAGE_TILE_OVERLAP_PX,
+) -> list[Any]:
+    """Split a page image into overlapping full-width vertical tiles."""
+    if PILImage is None or not isinstance(image, PILImage.Image):
+        raise TypeError("page tiling requires Pillow image inputs.")
+
+    return [
+        image.crop((0, top, image.width, bottom))
+        for top, bottom in _tile_vertical_bounds(image.height, max_tile_height, overlap_px)
+    ]
+
+
+def _normalized_nonempty_lines(text: str) -> list[str]:
+    """Normalize non-empty lines for overlap detection."""
+    normalized_lines: list[str] = []
+    for line in text.splitlines():
+        normalized = " ".join(line.split())
+        if normalized:
+            normalized_lines.append(normalized)
+    return normalized_lines
+
+
+def _trim_overlapping_line_prefix(previous_text: str, current_text: str, max_lines: int = 12) -> str:
+    """Trim a duplicated leading line prefix caused by tile overlap."""
+    previous_lines = _normalized_nonempty_lines(previous_text)
+    current_lines = _normalized_nonempty_lines(current_text)
+    if not previous_lines or not current_lines:
+        return current_text
+
+    overlap_size = 0
+    max_overlap = min(len(previous_lines), len(current_lines), max_lines)
+    for size in range(max_overlap, 0, -1):
+        if previous_lines[-size:] == current_lines[:size]:
+            overlap_size = size
+            break
+
+    if overlap_size == 0:
+        return current_text
+
+    lines = current_text.splitlines()
+    consumed = 0
+    trim_index = 0
+    while trim_index < len(lines) and consumed < overlap_size:
+        if " ".join(lines[trim_index].split()):
+            consumed += 1
+        trim_index += 1
+
+    return "\n".join(lines[trim_index:]).lstrip("\n")
+
+
+def _merge_tiled_texts(chunk_texts: list[str]) -> str:
+    """Merge tile text in order while trimming duplicated overlap lines."""
+    merged_text = ""
+    for text in chunk_texts:
+        if not text:
+            continue
+        if not merged_text:
+            merged_text = str(text)
+            continue
+
+        trimmed = _trim_overlapping_line_prefix(merged_text, str(text))
+        if trimmed:
+            merged_text = f"{merged_text.rstrip()}\n\n{trimmed.lstrip()}".rstrip()
+    return merged_text
+
+
 def _should_chunk_conversion(filepath: str, options: dict) -> bool:
     """Return True when option-driven PDF chunking should be used."""
     max_pages_per_chunk = options.get("max_pages_per_chunk")
     return max_pages_per_chunk is not None and Path(filepath).suffix.lower() == ".pdf"
+
+
+def _should_tile_pages(filepath: str, options: dict) -> bool:
+    """Return True when page-image tiling should be used for a PDF."""
+    return options.get("max_page_height_px") is not None and Path(filepath).suffix.lower() == ".pdf"
 
 
 def _get_pdf_page_count(filepath: str) -> int:
@@ -647,69 +967,30 @@ def _options_without_chunking(options: dict) -> dict:
     return filtered
 
 
-async def _convert_file_in_chunks(
-    filepath: str,
-    options: dict,
-    sync_converter,
-    warnings_list: list[str] | None = None,
-) -> list[Any]:
-    """Run sequential chunked conversions for large PDFs."""
-    base_options = _options_without_chunking(options)
-    max_pages_per_chunk = options["max_pages_per_chunk"]
-    requested_page_range = base_options.get("page_range")
-
-    if requested_page_range:
-        chunk_ranges = _chunk_requested_page_range(requested_page_range, max_pages_per_chunk)
-        if len(chunk_ranges) <= 1:
-            return [
-                await _run_conversion_with_fallbacks(
-                    filepath,
-                    base_options,
-                    sync_converter,
-                    warnings_list=warnings_list,
-                )
-            ]
-
-        chunk_results: list[Any] = []
-        for page_range in chunk_ranges:
-            chunk_options = {**base_options, "page_range": page_range}
-            chunk_results.append(
-                await _run_conversion_with_fallbacks(
-                    filepath,
-                    chunk_options,
-                    sync_converter,
-                    warnings_list=warnings_list,
-                )
-            )
-        return chunk_results
-
-    total_pages = _get_pdf_page_count(filepath)
-    if total_pages <= max_pages_per_chunk:
-        return [
-            await _run_conversion_with_fallbacks(
-                filepath,
-                base_options,
-                sync_converter,
-                warnings_list=warnings_list,
-            )
-        ]
-
-    chunk_results: list[Any] = []
-    for page_range in _chunk_page_ranges(total_pages, max_pages_per_chunk):
-        chunk_options = {**base_options, "page_range": page_range}
-        chunk_results.append(
-            await _run_conversion_with_fallbacks(
-                filepath,
-                chunk_options,
-                sync_converter,
-                warnings_list=warnings_list,
-            )
-        )
-    return chunk_results
+def _options_without_page_tiling(options: dict) -> dict:
+    """Strip page-tiling orchestration options before calling Marker."""
+    filtered = dict(options)
+    filtered.pop("max_page_height_px", None)
+    return filtered
 
 
-def _merge_chunk_results(chunk_results: list[dict]) -> dict:
-    """Merge structured chunk payloads into a single structured result."""
+def _render_pdf_page_image(filepath: str, page_number: int, dpi: int = _PAGE_TILE_RENDER_DPI) -> Any:
+    """Render a single PDF page to a Pillow image for tiled conversion."""
+    import pypdfium2 as pdfium
+    from marker.providers.pdf import PdfProvider
+
+    doc = None
+    try:
+        doc = pdfium.PdfDocument(filepath)
+        doc.init_forms()
+        return PdfProvider._render_image(doc, page_number, dpi, flatten_page=True)
+    finally:
+        if doc is not None:
+            doc.close()
+
+
+def _merge_structured_results(chunk_results: list[dict], text_merger=_merge_chunk_texts) -> dict:
+    """Merge structured conversion payloads using a caller-provided text merger."""
     metadata: dict[str, Any] = {}
     merged_assets: dict[str, Any] = {}
     merged_warnings: list[str] = []
@@ -748,11 +1029,149 @@ def _merge_chunk_results(chunk_results: list[dict]) -> dict:
         metadata["page_count"] = total_page_count
 
     return {
-        "text": _merge_chunk_texts([str(chunk_result.get("text", "")) for chunk_result in chunk_results]),
+        "text": text_merger([str(chunk_result.get("text", "")) for chunk_result in chunk_results]),
         "metadata": metadata,
         "warnings": merged_warnings,
         "assets": merged_assets,
     }
+
+
+async def _convert_file_in_chunks(
+    filepath: str,
+    options: dict,
+    sync_converter,
+    warnings_list: list[str] | None = None,
+) -> list[Any]:
+    """Run sequential chunked conversions for large PDFs."""
+    base_options = _options_without_chunking(options)
+    max_pages_per_chunk = options["max_pages_per_chunk"]
+    requested_page_range = base_options.get("page_range")
+
+    if requested_page_range:
+        chunk_ranges = _chunk_requested_page_range(requested_page_range, max_pages_per_chunk)
+        if len(chunk_ranges) <= 1:
+            return [
+                await _run_conversion_with_gpu_page_tiling_recovery(
+                    filepath,
+                    base_options,
+                    sync_converter,
+                    warnings_list=warnings_list,
+                    adaptive_options=base_options,
+                )
+            ]
+
+        chunk_results: list[Any] = []
+        for page_range in chunk_ranges:
+            chunk_options = {**base_options, "page_range": page_range}
+            try:
+                chunk_results.append(
+                    await _run_conversion_with_gpu_page_tiling_recovery(
+                        filepath,
+                        chunk_options,
+                        sync_converter,
+                        warnings_list=warnings_list,
+                        adaptive_options=base_options,
+                    )
+                )
+            finally:
+                _release_torch_memory()
+        return chunk_results
+
+    total_pages = _get_pdf_page_count(filepath)
+    if total_pages <= max_pages_per_chunk:
+        return [
+                await _run_conversion_with_gpu_page_tiling_recovery(
+                    filepath,
+                    base_options,
+                    sync_converter,
+                    warnings_list=warnings_list,
+                    adaptive_options=base_options,
+                )
+            ]
+
+    chunk_results: list[Any] = []
+    for page_range in _chunk_page_ranges(total_pages, max_pages_per_chunk):
+        chunk_options = {**base_options, "page_range": page_range}
+        try:
+            chunk_results.append(
+                await _run_conversion_with_gpu_page_tiling_recovery(
+                    filepath,
+                    chunk_options,
+                    sync_converter,
+                    warnings_list=warnings_list,
+                    adaptive_options=base_options,
+                )
+            )
+        finally:
+            _release_torch_memory()
+    return chunk_results
+
+
+def _merge_chunk_results(chunk_results: list[dict]) -> dict:
+    """Merge structured chunk payloads into a single structured result."""
+    return _merge_structured_results(chunk_results, text_merger=_merge_chunk_texts)
+
+
+async def _convert_file_with_page_tiling(
+    filepath: str,
+    options: dict,
+    sync_converter,
+    warnings_list: list[str] | None = None,
+    allow_cpu_fallback: bool = True,
+) -> dict:
+    """Convert a PDF by rasterizing requested pages into smaller image tiles."""
+    base_options = _options_without_page_tiling(_options_without_chunking(options))
+    max_page_height_px = options["max_page_height_px"]
+    requested_pages = _requested_page_numbers(filepath, options)
+    base_options.pop("page_range", None)
+
+    warning_message = (
+        "Experimental page tiling enabled: PDF pages are rasterized into smaller image strips, "
+        "which can reduce peak memory but may alter reading order and OCR quality."
+    )
+    if warnings_list is not None and warning_message not in warnings_list:
+        warnings_list.append(warning_message)
+
+    page_results: list[dict] = []
+    with tempfile.TemporaryDirectory(prefix="marker-page-tiles-") as temp_dir:
+        temp_dir_path = Path(temp_dir)
+
+        for page_number in requested_pages:
+            page_image = None
+            tile_images: list[Any] = []
+            tile_results: list[dict] = []
+            try:
+                page_image = _render_pdf_page_image(filepath, page_number, dpi=_PAGE_TILE_RENDER_DPI)
+                tile_images = _tile_page_image(page_image, max_page_height_px)
+
+                for tile_index, tile_image in enumerate(tile_images):
+                    tile_path = temp_dir_path / f"page_{page_number:04d}_tile_{tile_index:03d}.png"
+                    try:
+                        tile_image.save(tile_path, format="PNG")
+                        tile_results.append(
+                            await _run_conversion_with_fallbacks(
+                                str(tile_path),
+                                base_options,
+                                sync_converter,
+                                warnings_list=warnings_list,
+                                allow_cpu_fallback=allow_cpu_fallback,
+                            )
+                        )
+                    finally:
+                        _close_image(tile_image)
+                        tile_path.unlink(missing_ok=True)
+                        _release_torch_memory()
+
+                page_result = _merge_structured_results(tile_results, text_merger=_merge_tiled_texts)
+                page_result.setdefault("metadata", {})
+                page_result["metadata"]["page_count"] = 1
+                page_results.append(page_result)
+            finally:
+                if page_image is not None:
+                    _close_image(page_image)
+                _release_torch_memory()
+
+    return _merge_chunk_results(page_results)
 
 
 # ---------------------------------------------------------------------------
@@ -762,18 +1181,37 @@ def _merge_chunk_results(chunk_results: list[dict]) -> dict:
 async def convert_file(filepath: str, options: Optional[dict] = None) -> str:
     """Convert a document at the given file path and return the converted text."""
     opts = {"output_format": "markdown", **(options or {})}
+    if _should_tile_pages(filepath, opts):
+        result = await _convert_file_with_page_tiling(
+            filepath,
+            opts,
+            _convert_sync_result,
+        )
+        return str(result["text"])
+
     if _should_chunk_conversion(filepath, opts):
         chunk_results = await _convert_file_in_chunks(filepath, opts, _convert_sync)
         return _merge_chunk_texts([str(chunk_result) for chunk_result in chunk_results])
 
-    return await _run_conversion_with_fallbacks(filepath, _options_without_chunking(opts), _convert_sync)
+    return await _run_conversion_with_gpu_page_tiling_recovery(
+        filepath,
+        _options_without_page_tiling(_options_without_chunking(opts)),
+        _convert_sync,
+    )
 
 
 async def convert_file_result(filepath: str, options: Optional[dict] = None) -> dict:
     """Convert a document at the given file path and return a structured result."""
     opts = {"output_format": "markdown", **(options or {})}
     fallback_warnings: list[str] = []
-    if _should_chunk_conversion(filepath, opts):
+    if _should_tile_pages(filepath, opts):
+        result = await _convert_file_with_page_tiling(
+            filepath,
+            opts,
+            _convert_sync_result,
+            warnings_list=fallback_warnings,
+        )
+    elif _should_chunk_conversion(filepath, opts):
         chunk_results = await _convert_file_in_chunks(
             filepath,
             opts,
@@ -782,9 +1220,9 @@ async def convert_file_result(filepath: str, options: Optional[dict] = None) -> 
         )
         result = _merge_chunk_results(chunk_results)
     else:
-        result = await _run_conversion_with_fallbacks(
+        result = await _run_conversion_with_gpu_page_tiling_recovery(
             filepath,
-            _options_without_chunking(opts),
+            _options_without_page_tiling(_options_without_chunking(opts)),
             _convert_sync_result,
             warnings_list=fallback_warnings,
         )

@@ -151,6 +151,23 @@ python examples/convert_pdf.py \
   --page-range 0-1 \
   --max-pages-per-chunk 2 \
   -o examples/s00466-025-02696-0-sample.md
+
+# Experimental: split each requested page into smaller horizontal strips
+python examples/convert_pdf.py \
+  examples/s00466-025-02696-0.pdf \
+  --page-range 0-10 \
+  --ocr-device cuda \
+  --model-dtype float16 \
+  --gpu-memory-profile low-vram \
+  --max-pages-per-chunk 1 \
+  -o examples/s00466-025-02696-0-low-vram.md
+
+# Experimental: split each requested page into smaller horizontal strips
+python examples/convert_pdf.py \
+  examples/s00466-025-02696-0.pdf \
+  --page-range 0-10 \
+  --max-page-height-px 1600 \
+  -o examples/s00466-025-02696-0-tiling.md
 ```
 
 The example script writes the Markdown file and saves any extracted image assets into the same output directory, so the generated `![](...)` references resolve locally.
@@ -241,6 +258,23 @@ How it works:
 - only applies to **PDF** inputs
 - processes the document in ordered `page_range` batches such as `0-3`, `4-7`, ...
 - merges the chunk outputs back into a single markdown result
+
+For 8 GB-class GPUs, prefer combining chunking with the low-VRAM GPU profile:
+
+```python
+result = await convert_file(
+    "large-paper.pdf",
+    {
+        "output_format": "markdown",
+        "max_pages_per_chunk": 1,
+        "gpu_memory_profile": "low-vram",
+    },
+)
+```
+
+`gpu_memory_profile="low-vram"` keeps the conversion on GPU but lowers Marker batch
+sizes for layout, detection, OCR error detection, table recognition, and text
+recognition. It is usually much faster than CPU fallback while using less peak VRAM.
 - also splits an explicit `page_range` like `0-10` into smaller batches when `max_pages_per_chunk` is set
 
 Recommended settings for large scientific papers on limited GPUs:
@@ -257,9 +291,51 @@ Notes:
 
 - `max_pages_per_chunk` helps reduce peak memory, but it does **not** guarantee a GPU run
   will succeed for every document.
-- If a CUDA conversion still runs out of memory, `marker-mcp` now retries the conversion on
-  **CPU** automatically.
+- If a CUDA conversion still runs out of memory, `marker-mcp` now retries the **failing step** on
+  **CPU** automatically, then restores the preferred runtime for subsequent steps.
+- For single-page PDF chunks, `marker-mcp` now tries progressively smaller **GPU page tiling**
+  sizes before CPU fallback so a one-page OOM does not immediately turn into a long CPU-bound stall.
+- Long chunked/tiled runs now trigger Python garbage collection and CUDA cache cleanup between
+  chunk/tile steps to reduce progressive memory growth.
+- When `pdftext_workers` is not explicitly configured, `marker-mcp` now defaults it to **8**
+  worker processes instead of forcing a single worker.
 - Smaller values such as `2`, `4`, or `8` are the best starting points for large academic PDFs.
+
+### Experimental page tiling for very large pages
+
+If whole pages are still too large for the GPU, you can rasterize each requested PDF page into
+smaller **horizontal strips** and run Marker on those strips sequentially:
+
+```python
+result = await convert_file(
+    "large-paper.pdf",
+    {
+        "output_format": "markdown",
+        "page_range": "0-10",
+        "max_page_height_px": 1600,
+    },
+)
+```
+
+The MCP tools expose the same option:
+
+```text
+convert_document(
+  filepath="/path/to/large-paper.pdf",
+  output_format="markdown",
+  page_range="0-10",
+  max_page_height_px=1600
+)
+```
+
+Notes:
+
+- this mode is **experimental** and currently only applies to **PDF** inputs
+- it rasterizes pages before processing, so it behaves more like an OCR-first path than native
+  PDF text extraction
+- it can reduce peak GPU memory on very large pages, but may alter reading order or duplicate/omit
+  text around tile boundaries
+- start with values like **1200**, **1600**, or **2000** pixels and adjust based on your hardware
 
 ---
 
@@ -352,6 +428,8 @@ Notes:
 - `auto` leaves device selection to Marker / PyTorch detection.
 - `MARKER_MCP_MODEL_DTYPE` / `--model-dtype` is experimental and currently supports
   `float32`, `float16`, and `bfloat16`.
+- For conversion-time VRAM tuning, use `gpu_memory_profile="low-vram"` on the document
+  conversion tools or `--gpu-memory-profile low-vram` in `examples/convert_pdf.py`.
 
 ---
 

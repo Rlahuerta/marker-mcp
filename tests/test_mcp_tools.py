@@ -119,6 +119,18 @@ class TestConvertDocument:
         opts = mock_cf.call_args[0][1]
         assert opts["max_pages_per_chunk"] == 8
 
+    async def test_max_page_height_px_forwarded(self, tmp_pdf_file):
+        with patch("marker_mcp.conversion_service.convert_file", return_value="ok") as mock_cf:
+            await _call("convert_document", filepath=str(tmp_pdf_file), max_page_height_px=1600)
+        opts = mock_cf.call_args[0][1]
+        assert opts["max_page_height_px"] == 1600
+
+    async def test_gpu_memory_profile_forwarded(self, tmp_pdf_file):
+        with patch("marker_mcp.conversion_service.convert_file", return_value="ok") as mock_cf:
+            await _call("convert_document", filepath=str(tmp_pdf_file), gpu_memory_profile="low-vram")
+        opts = mock_cf.call_args[0][1]
+        assert opts["gpu_memory_profile"] == "low-vram"
+
 
 class TestConvertDocumentResult:
     async def test_returns_text_metadata_and_asset_paths(self, tmp_pdf_file):
@@ -163,6 +175,42 @@ class TestConvertDocumentResult:
 
         opts = mock_result.call_args[0][1]
         assert opts["max_pages_per_chunk"] == 8
+
+    async def test_max_page_height_px_forwarded(self, tmp_pdf_file):
+        payload = {
+            "text": "# Result",
+            "metadata": {},
+            "warnings": [],
+            "assets": {},
+        }
+
+        with patch(
+            "marker_mcp.conversion_service.convert_file_result",
+            return_value=payload,
+            create=True,
+        ) as mock_result:
+            await _call("convert_document_result", filepath=str(tmp_pdf_file), max_page_height_px=1600)
+
+        opts = mock_result.call_args[0][1]
+        assert opts["max_page_height_px"] == 1600
+
+    async def test_gpu_memory_profile_forwarded(self, tmp_pdf_file):
+        payload = {
+            "text": "# Result",
+            "metadata": {},
+            "warnings": [],
+            "assets": {},
+        }
+
+        with patch(
+            "marker_mcp.conversion_service.convert_file_result",
+            return_value=payload,
+            create=True,
+        ) as mock_result:
+            await _call("convert_document_result", filepath=str(tmp_pdf_file), gpu_memory_profile="low-vram")
+
+        opts = mock_result.call_args[0][1]
+        assert opts["gpu_memory_profile"] == "low-vram"
 
     async def test_exports_marker_figures_as_serializable_assets(self, tmp_pdf_file):
         markdown = "![Figure](_page_0_Picture_2.jpeg)"

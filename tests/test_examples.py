@@ -27,6 +27,8 @@ def test_convert_pdf_example_builds_chunking_options():
         paginate_output=True,
         page_range="0-2",
         max_pages_per_chunk=4,
+        max_page_height_px=1600,
+        gpu_memory_profile="low-vram",
         use_llm=True,
     )
 
@@ -35,6 +37,8 @@ def test_convert_pdf_example_builds_chunking_options():
         "paginate_output": True,
         "page_range": "0-2",
         "max_pages_per_chunk": 4,
+        "max_page_height_px": 1600,
+        "gpu_memory_profile": "low-vram",
         "use_llm": True,
     }
 
@@ -49,6 +53,8 @@ async def test_convert_pdf_example_writes_output_file(tmp_path):
         output=output_md,
         page_range=None,
         max_pages_per_chunk=2,
+        max_page_height_px=None,
+        gpu_memory_profile=None,
         ocr_device="cpu",
         model_dtype="bfloat16",
         use_llm=False,
@@ -76,6 +82,8 @@ async def test_convert_pdf_example_writes_image_assets_next_to_markdown(tmp_path
         output=output_md,
         page_range=None,
         max_pages_per_chunk=2,
+        max_page_height_px=None,
+        gpu_memory_profile=None,
         ocr_device=None,
         model_dtype=None,
         use_llm=False,
