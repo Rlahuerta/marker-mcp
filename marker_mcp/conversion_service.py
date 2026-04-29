@@ -14,8 +14,10 @@ import contextlib
 import gc
 import mimetypes
 import os
+import re
 import tempfile
 import warnings
+from difflib import SequenceMatcher
 from inspect import Parameter, signature
 from io import BytesIO
 from pathlib import Path
@@ -25,9 +27,11 @@ _AUTO_DEVICE_SENTINEL = "__auto__"
 _MODEL_DTYPE_CHOICES = {"float16", "float32", "bfloat16"}
 _GPU_MEMORY_PROFILE_CHOICES = {"low-vram"}
 _DEFAULT_PAGE_TILE_OVERLAP_PX = 96
+_MIN_PAGE_TILE_OVERLAP_PX = 24
 _PAGE_TILE_RENDER_DPI = 192
 _DEFAULT_GPU_OOM_TILE_HEIGHT_PX = 1600
 _DEFAULT_PDFTEXT_WORKERS = 8
+_PAGE_SEPARATOR_DASH_COUNT = 48
 _LOW_VRAM_GPU_CONFIG = {
     "layout_batch_size": 2,
     "detection_batch_size": 1,
@@ -144,7 +148,7 @@ except Exception:  # pragma: no cover - Pillow is an indirect Marker dependency.
 #
 # Ollama (local):
 #   OLLAMA_BASE_URL    base URL            (default: http://localhost:11434)
-#   OLLAMA_MODEL       vision model name   (default: llama3.2-vision)
+#   OLLAMA_MODEL       vision model name   (recommended: gemma4:31b-cloud)
 #
 # OpenAI / compatible:
 #   OPENAI_API_KEY     API key
@@ -163,6 +167,15 @@ def _llm_options_from_env() -> dict:
     """Build the LLM-related options dict from environment variables."""
     opts: dict = {}
 
+    def _int_env(name: str) -> int | None:
+        raw = os.environ.get(name)
+        if raw is None:
+            return None
+        raw = raw.strip()
+        if not raw:
+            return None
+        return int(raw)
+
     explicit_service = os.environ.get("MARKER_LLM_SERVICE")
     if explicit_service:
         opts["llm_service"] = explicit_service
@@ -171,11 +184,17 @@ def _llm_options_from_env() -> dict:
     ollama_url = os.environ.get("OLLAMA_BASE_URL")
     ollama_model = os.environ.get("OLLAMA_MODEL")
     if (ollama_url or ollama_model) and not explicit_service:
-        opts["llm_service"] = "marker.services.ollama.OllamaService"
+        opts["llm_service"] = "marker_mcp.ollama_service.OllamaService"
     if ollama_url:
         opts["ollama_base_url"] = ollama_url
     if ollama_model:
         opts["ollama_model"] = ollama_model
+    ollama_batch_size = _int_env("OLLAMA_BATCH_SIZE")
+    ollama_batch_wait_ms = _int_env("OLLAMA_BATCH_WAIT_MS")
+    if ollama_batch_size is not None:
+        opts["ollama_batch_size"] = ollama_batch_size
+    if ollama_batch_wait_ms is not None:
+        opts["ollama_batch_wait_ms"] = ollama_batch_wait_ms
 
     # OpenAI-compatible — detected by OPENAI_API_KEY being set
     openai_key = os.environ.get("OPENAI_API_KEY")
@@ -876,15 +895,21 @@ def _tile_vertical_bounds(
 def _tile_page_image(
     image: Any,
     max_tile_height: int,
-    overlap_px: int = _DEFAULT_PAGE_TILE_OVERLAP_PX,
+    overlap_px: int | None = None,
 ) -> list[Any]:
     """Split a page image into overlapping full-width vertical tiles."""
     if PILImage is None or not isinstance(image, PILImage.Image):
         raise TypeError("page tiling requires Pillow image inputs.")
 
+    effective_overlap = (
+        _page_tile_overlap_px(max_tile_height)
+        if overlap_px is None
+        else overlap_px
+    )
+
     return [
         image.crop((0, top, image.width, bottom))
-        for top, bottom in _tile_vertical_bounds(image.height, max_tile_height, overlap_px)
+        for top, bottom in _tile_vertical_bounds(image.height, max_tile_height, effective_overlap)
     ]
 
 
@@ -926,20 +951,162 @@ def _trim_overlapping_line_prefix(previous_text: str, current_text: str, max_lin
     return "\n".join(lines[trim_index:]).lstrip("\n")
 
 
+def _page_tile_overlap_px(max_tile_height: int) -> int:
+    """Choose a smaller overlap for smaller tiles to reduce duplicate OCR regions."""
+    if max_tile_height <= 0:
+        raise ValueError("max_page_height_px must be greater than zero.")
+
+    overlap_px = min(_DEFAULT_PAGE_TILE_OVERLAP_PX, max_tile_height // 6)
+    overlap_px = max(_MIN_PAGE_TILE_OVERLAP_PX, overlap_px)
+    return min(overlap_px, max_tile_height - 1)
+
+
+def _page_separator(page_number: int) -> str:
+    """Return the Marker-style page separator used by paginated markdown output."""
+    return f"{{{page_number}}}{'-' * _PAGE_SEPARATOR_DASH_COUNT}"
+
+
+def _strip_tile_page_separators(text: str) -> str:
+    """Drop per-tile pagination markers before merging tiles back into full pages."""
+    cleaned_lines = [
+        line
+        for line in str(text).splitlines()
+        if not re.fullmatch(r"\{\d+\}-+", line.strip())
+    ]
+    return "\n".join(cleaned_lines).strip()
+
+
+def _split_markdown_blocks(text: str) -> list[str]:
+    """Split markdown into paragraph-like blocks separated by blank lines."""
+    blocks: list[str] = []
+    current: list[str] = []
+
+    for line in text.splitlines():
+        if line.strip():
+            current.append(line.rstrip())
+            continue
+        if current:
+            blocks.append("\n".join(current).strip())
+            current = []
+
+    if current:
+        blocks.append("\n".join(current).strip())
+    return blocks
+
+
+def _normalize_tiled_block(text: str) -> str:
+    """Normalize a markdown block for duplicate detection after tiling."""
+    normalized = str(text)
+    normalized = re.sub(r"!\[[^\]]*\]\([^)]+\)", "image", normalized)
+    normalized = re.sub(r"<[^>]+>", "", normalized)
+    normalized = normalized.replace("\\*", "*")
+    normalized = re.sub(r"[#*_`|>-]+", " ", normalized)
+    normalized = re.sub(r"[^\w\s]", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized)
+    return normalized.strip().lower()
+
+
+def _looks_like_repeated_phrase_gibberish(text: str) -> bool:
+    """Detect obvious OCR loops where the same short phrase repeats excessively."""
+    words = re.findall(r"\b[\w'-]+\b", text.lower())
+    if len(words) < 12:
+        return False
+
+    for phrase_len in (2, 3, 4):
+        if len(words) < phrase_len * 4:
+            continue
+        phrase = words[:phrase_len]
+        repetitions = 0
+        position = 0
+        while position + phrase_len <= len(words) and words[position : position + phrase_len] == phrase:
+            repetitions += 1
+            position += phrase_len
+        if repetitions >= 4 and position >= int(len(words) * 0.75):
+            return True
+    return False
+
+
+def _tiled_block_quality_score(text: str) -> tuple[int, int]:
+    """Prefer fuller, cleaner OCR blocks when overlaps produce near-duplicates."""
+    normalized = _normalize_tiled_block(text)
+    alpha_words = re.findall(r"[A-Za-z]+", text)
+    vowel_words = sum(any(char in "aeiouAEIOU" for char in word) for word in alpha_words)
+    penalties = len(re.findall(r"\\\*\d+", text))
+    penalties += len(re.findall(r"\b\d{3,}\b", text))
+    penalties += len(re.findall(r"([A-Za-z]{2,})(?: \1){3,}", text.lower()))
+    return (vowel_words - (penalties * 3), len(normalized))
+
+
+def _blocks_should_deduplicate(previous_block: str, current_block: str) -> bool:
+    """Return True when two nearby tiled blocks are likely duplicate overlap content."""
+    previous_normalized = _normalize_tiled_block(previous_block)
+    current_normalized = _normalize_tiled_block(current_block)
+    if not previous_normalized or not current_normalized:
+        return False
+    if previous_normalized == current_normalized:
+        return True
+
+    minimum_length = min(len(previous_normalized), len(current_normalized))
+    if minimum_length >= 40 and (
+        previous_normalized in current_normalized
+        or current_normalized in previous_normalized
+    ):
+        return True
+
+    if minimum_length < 24:
+        return False
+
+    return SequenceMatcher(None, previous_normalized, current_normalized).ratio() >= 0.88
+
+
+def _cleanup_tiled_page_text(text: str) -> str:
+    """Remove tile-only artifacts and replace weaker overlap fragments with better blocks."""
+    blocks = _split_markdown_blocks(_strip_tile_page_separators(text))
+    cleaned_blocks: list[str] = []
+    seen_image_blocks: set[str] = set()
+
+    for block in blocks:
+        if not block:
+            continue
+        if _looks_like_repeated_phrase_gibberish(block):
+            continue
+        if block.startswith("!["):
+            if block in seen_image_blocks:
+                continue
+            seen_image_blocks.add(block)
+
+        deduplicated = False
+        for index in range(len(cleaned_blocks) - 1, max(-1, len(cleaned_blocks) - 5), -1):
+            previous_block = cleaned_blocks[index]
+            if not _blocks_should_deduplicate(previous_block, block):
+                continue
+
+            if _tiled_block_quality_score(block) > _tiled_block_quality_score(previous_block):
+                cleaned_blocks[index] = block
+            deduplicated = True
+            break
+
+        if not deduplicated:
+            cleaned_blocks.append(block)
+
+    return "\n\n".join(cleaned_blocks).strip()
+
+
 def _merge_tiled_texts(chunk_texts: list[str]) -> str:
     """Merge tile text in order while trimming duplicated overlap lines."""
     merged_text = ""
     for text in chunk_texts:
-        if not text:
+        cleaned_text = _strip_tile_page_separators(str(text))
+        if not cleaned_text:
             continue
         if not merged_text:
-            merged_text = str(text)
+            merged_text = cleaned_text
             continue
 
-        trimmed = _trim_overlapping_line_prefix(merged_text, str(text))
+        trimmed = _trim_overlapping_line_prefix(merged_text, cleaned_text)
         if trimmed:
             merged_text = f"{merged_text.rstrip()}\n\n{trimmed.lstrip()}".rstrip()
-    return merged_text
+    return _cleanup_tiled_page_text(merged_text)
 
 
 def _should_chunk_conversion(filepath: str, options: dict) -> bool:
@@ -1121,6 +1288,7 @@ async def _convert_file_with_page_tiling(
 ) -> dict:
     """Convert a PDF by rasterizing requested pages into smaller image tiles."""
     base_options = _options_without_page_tiling(_options_without_chunking(options))
+    paginate_output = bool(base_options.pop("paginate_output", True))
     max_page_height_px = options["max_page_height_px"]
     requested_pages = _requested_page_numbers(filepath, options)
     base_options.pop("page_range", None)
@@ -1165,6 +1333,10 @@ async def _convert_file_with_page_tiling(
                 page_result = _merge_structured_results(tile_results, text_merger=_merge_tiled_texts)
                 page_result.setdefault("metadata", {})
                 page_result["metadata"]["page_count"] = 1
+                page_text = _strip_tile_page_separators(str(page_result.get("text", "")))
+                if page_text and paginate_output:
+                    page_text = f"{_page_separator(page_number)}\n\n{page_text}".rstrip()
+                page_result["text"] = page_text
                 page_results.append(page_result)
             finally:
                 if page_image is not None:

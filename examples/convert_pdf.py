@@ -4,6 +4,8 @@ import asyncio
 import os
 from pathlib import Path
 
+_DEFAULT_OLLAMA_CLOUD_MODEL = "gemma4:31b-cloud"
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Convert a PDF document to Markdown with marker-mcp.")
@@ -37,6 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["low-vram"],
         default=None,
         help="Optional GPU memory tuning profile that lowers Marker batch sizes while staying on GPU.",
+    )
+    parser.add_argument(
+        "--lowres-image-dpi",
+        type=int,
+        default=None,
+        help="Override Marker low-resolution page DPI used for layout and line detection.",
+    )
+    parser.add_argument(
+        "--highres-image-dpi",
+        type=int,
+        default=None,
+        help="Override Marker high-resolution page DPI used for OCR while keeping full pages intact.",
     )
     parser.add_argument(
         "--ocr-device",
@@ -87,6 +101,10 @@ def build_options(args: argparse.Namespace) -> dict:
         options["max_page_height_px"] = args.max_page_height_px
     if args.gpu_memory_profile is not None:
         options["gpu_memory_profile"] = args.gpu_memory_profile
+    if args.lowres_image_dpi is not None:
+        options["lowres_image_dpi"] = args.lowres_image_dpi
+    if args.highres_image_dpi is not None:
+        options["highres_image_dpi"] = args.highres_image_dpi
     if args.use_llm:
         options["use_llm"] = True
     return options
@@ -128,17 +146,39 @@ def save_assets(output_dir: Path, assets: dict) -> list[Path]:
     return saved_paths
 
 
+def configure_llm_environment(args: argparse.Namespace) -> None:
+    """Ensure the example CLI has a usable LLM configuration when requested."""
+    if not args.use_llm:
+        return
+
+    if os.environ.get("MARKER_LLM_SERVICE"):
+        return
+
+    if os.environ.get("OLLAMA_MODEL"):
+        return
+
+    if any(os.environ.get(key) for key in ("OPENAI_API_KEY", "CLAUDE_API_KEY", "GOOGLE_API_KEY")):
+        return
+
+    os.environ["OLLAMA_MODEL"] = _DEFAULT_OLLAMA_CLOUD_MODEL
+
+
 async def convert_pdf(args: argparse.Namespace) -> Path:
     if args.ocr_device is not None:
         os.environ["MARKER_MCP_OCR_DEVICE"] = args.ocr_device
     if args.model_dtype is not None:
         os.environ["MARKER_MCP_MODEL_DTYPE"] = args.model_dtype
+    configure_llm_environment(args)
 
-    from marker_mcp.conversion_service import convert_file_result
+    from marker_mcp.conversion_service import _llm_options_from_env, convert_file_result
 
     input_pdf = args.input_pdf.resolve()
     output_md = resolve_output_path(input_pdf, args.output)
-    result = await convert_file_result(str(input_pdf), build_options(args))
+    options = build_options(args)
+    if args.use_llm:
+        options.update(_llm_options_from_env())
+
+    result = await convert_file_result(str(input_pdf), options)
 
     output_md.parent.mkdir(parents=True, exist_ok=True)
     output_md.write_text(result["text"], encoding="utf-8")
@@ -171,6 +211,18 @@ def main() -> None:
 if __name__ == "__main__":
     #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-5 --ocr-device "cuda" --model-dtype "float16" --max-pages-per-chunk 1 -o risks-13-00247-v2.md
     #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-10 --ocr-device "cuda" --model-dtype "float16" --gpu-memory-profile low-vram --max-pages-per-chunk 1 -o risks-13-00247-v2.md
-    #  python convert_pdf.py risks-13-00247-v2.pdf --page-range 0-10 --ocr-device "cuda" --max-page-height-px 300 -o risks-13-00247-v2.md
+    #  python convert_pdf.py risks-13-00247-v2.pdf --use-llm --page-range 0-10 --ocr-device "cuda" --max-page-height-px 250 -o risks-13-00247-v2.md
+    #  python convert_pdf.py risks-13-00247-v2.pdf --use-llm --page-range 0-20 --ocr-device "cuda" --gpu-memory-profile low-vram --max-pages-per-chunk 1 --lowres-image-dpi 72 --highres-image-dpi 144 -o risks-13-00247-v2_fullpage_llm.md
+
+    #  conda run -n marker-mcp python convert_pdf.py \
+    #    risks-13-00247-v2.pdf \
+    #    --use-llm \
+    #    --page-range 0-10 \
+    #    --ocr-device cuda \
+    #    --gpu-memory-profile low-vram \
+    #    --max-pages-per-chunk 1 \
+    #    --lowres-image-dpi 72 \
+    #    --highres-image-dpi 144 \
+    #    -o risks-13-00247-v2_fullpage_llm.md
 
     main()

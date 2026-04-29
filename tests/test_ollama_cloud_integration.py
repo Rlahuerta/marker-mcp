@@ -28,8 +28,11 @@ Run::
 
 from __future__ import annotations
 
+import json
 import os
+import subprocess
 import sys
+import textwrap
 import urllib.request
 from pathlib import Path
 
@@ -44,6 +47,7 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 SAMPLE_PDF = FIXTURES_DIR / "sample.pdf"
 COMPLEX_PDF = FIXTURES_DIR / "complex_document.pdf"
 ENV_FILE = Path(__file__).parent.parent / ".env"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 # ---------------------------------------------------------------------------
@@ -154,6 +158,40 @@ def _llm_options() -> dict:
     return server._build_options("markdown", None, False, False, True)
 
 
+def _run_real_python(script: str, extra_env: dict[str, str] | None = None) -> dict:
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT) + os.pathsep + env.get("PYTHONPATH", "")
+    if extra_env:
+        env.update(extra_env)
+
+    proc = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+    stdout = proc.stdout.strip()
+    stdout_lines = [line for line in stdout.splitlines() if line.strip()]
+    payload = stdout_lines[-1] if stdout_lines else ""
+
+    if payload.startswith("SKIP:"):
+        pytest.skip(payload.removeprefix("SKIP:").strip())
+
+    if proc.returncode != 0:
+        raise AssertionError(
+            "Integration subprocess failed.\n"
+            f"STDOUT:\n{proc.stdout}\n"
+            f"STDERR:\n{proc.stderr}"
+        )
+
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise AssertionError(f"Expected JSON output from subprocess, got:\n{stdout}") from exc
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -256,3 +294,55 @@ async def test_ollama_cloud_convert_bytes_path():
     assert isinstance(result, str)
     assert len(result) > 200
     assert "#" in result
+
+
+async def test_ollama_cloud_example_cli_path():
+    """End-to-end: run examples/convert_pdf.py with --use-llm against Ollama Cloud."""
+    pdf_path = _require_fixture(SAMPLE_PDF)
+    env = _load_dotenv(ENV_FILE)
+    data = _run_real_python(
+        textwrap.dedent(
+            f"""
+            import importlib.util
+            import json
+            from pathlib import Path
+            try:
+                example_path = Path("examples/convert_pdf.py").resolve()
+                spec = importlib.util.spec_from_file_location("examples.convert_pdf", example_path)
+                module = importlib.util.module_from_spec(spec)
+                assert spec.loader is not None
+                spec.loader.exec_module(module)
+            except Exception as exc:
+                print(f"SKIP:Could not import example CLI: {{exc}}")
+                raise SystemExit(0)
+
+            import asyncio
+
+            output_path = Path("tests/fixtures/sample-ollama-cloud-example.md").resolve()
+            args = module.build_parser().parse_args([
+                {pdf_path!r},
+                "--page-range", "0-0",
+                "--use-llm",
+                "-o", str(output_path),
+            ])
+
+            async def main():
+                written = await module.convert_pdf(args)
+                text = written.read_text(encoding="utf-8")
+                print(json.dumps({{
+                    "output_exists": written.exists(),
+                    "length": len(text),
+                    "has_heading": "#" in text,
+                    "uses_cloud_model": {env.get("OLLAMA_MODEL", "").strip()!r}.endswith("-cloud"),
+                }}))
+                written.unlink(missing_ok=True)
+
+            asyncio.run(main())
+            """
+        )
+    )
+
+    assert data["output_exists"] is True
+    assert data["length"] > 100
+    assert data["has_heading"] is True
+    assert data["uses_cloud_model"] is True

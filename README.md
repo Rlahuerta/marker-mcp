@@ -383,7 +383,9 @@ Swap the commented lines to use the published `marker-pdf` package from PyPI ins
 | `MARKER_LLM_SERVICE`    | *(auto)*                     | Override LLM service class explicitly                                            |
 | `GOOGLE_API_KEY`        | *(none)*                     | Gemini API key — auto-selects `GoogleGeminiService`                              |
 | `OLLAMA_BASE_URL`       | *(none)*                     | Ollama URL — auto-selects `OllamaService`                                        |
-| `OLLAMA_MODEL`          | `llama3.2-vision`            | Ollama model name (use `gemma4:31b` for best quality)                            |
+| `OLLAMA_MODEL`          | `gemma4:31b-cloud`           | Ollama Cloud model name                                                           |
+| `OLLAMA_BATCH_SIZE`     | `3`                          | Max compatible Ollama LLM tasks to combine into one micro-batched request        |
+| `OLLAMA_BATCH_WAIT_MS`  | `50`                         | Time window used to gather compatible Ollama tasks into one batched request      |
 | `OLLAMA_NO_CLOUD`       | *(unset)*                    | Set to `1` to disable Ollama Cloud routing                                       |
 | `OPENAI_API_KEY`        | *(none)*                     | OpenAI key — auto-selects `OpenAIService`                                        |
 | `OPENAI_BASE_URL`       | `https://api.openai.com/v1`  | OpenAI-compatible base URL                                                       |
@@ -451,46 +453,29 @@ change the tool call. The service is auto-detected based on which key is present
 | Priority     | Env var set                         | Service used               |
 | ------------ | ----------------------------------- | -------------------------- |
 | 1 (explicit) | `MARKER_LLM_SERVICE`                | whatever class you specify |
-| 2            | `OLLAMA_BASE_URL` or `OLLAMA_MODEL` | Ollama (local)             |
+| 2            | `OLLAMA_BASE_URL` or `OLLAMA_MODEL` | Ollama / Ollama Cloud      |
 | 3            | `OPENAI_API_KEY`                    | OpenAI / compatible        |
 | 4            | `CLAUDE_API_KEY`                    | Anthropic Claude           |
 | 5 (default)  | `GOOGLE_API_KEY`                    | Google Gemini              |
 
 ---
 
-### Ollama (local, privacy-first) — recommended for self-hosted use
+### Ollama Cloud — recommended
 
-Ollama runs entirely on your machine — no data leaves your network. It also offers
-**Ollama Cloud** to offload inference to ollama.com servers when local hardware is limited.
+This project now documents and tests **Ollama Cloud** models only.
 
 > **A vision/multimodal model is required.** Marker sends page images (base64) to the LLM
 > for table reconstruction, math, and form extraction. Text-only models will not work.
 
-#### Recommended models
+#### Recommended model
 
-| Model             | Size   | VRAM (Q4) | Vision | Notes                                                     |
-| ----------------- | ------ | --------- | ------ | --------------------------------------------------------- |
-| `gemma4:31b`      | ~62 GB | ~16 GB    | ✅      | **Best quality** — Google's latest multimodal, April 2025 |
-| `llama3.2-vision` | ~7 B   | ~6 GB     | ✅      | Default — good balance of speed and quality               |
-| `llava`           | ~7 B   | ~6 GB     | ✅      | Established alternative                                   |
-| `minicpm-v`       | ~4 B   | ~4 GB     | ✅      | Smallest option, fast on CPU                              |
+| Model              | Vision | Notes                                                             |
+| ------------------ | ------ | ----------------------------------------------------------------- |
+| `gemma4:31b-cloud` | ✅      | **Recommended** — cloud-routed multimodal model for best quality |
 
-**Gemma4** (`gemma4:31b`) is Google DeepMind's newest generation model (released April 2025).
-It supports variable aspect ratios, configurable visual token budgets, and delivers
-significantly higher accuracy than llama3.2-vision — especially on complex tables, math,
-and multi-column layouts. It is fully API-compatible with Marker's `OllamaService` with
-no code changes required.
-
-VRAM requirements for `gemma4:31b` by quantization:
-
-| Quantization | VRAM       | Typical GPU                       |
-| ------------ | ---------- | --------------------------------- |
-| FP16         | ~31 GB     | A100, H100                        |
-| Q8_0         | ~30 GB     | A100 (40 GB)                      |
-| Q5_0         | ~18 GB     | RTX 6000 Ada                      |
-| **Q4_0**     | **~16 GB** | **RTX 4090 / 3090** ← recommended |
-| Q3_K_M       | ~12 GB     | RTX 3080 Ti                       |
-| Q2_K         | ~8 GB      | RTX 3070                          |
+`gemma4:31b-cloud` routes through the local Ollama daemon to ollama.com servers.
+It is the cloud-routed multimodal model used by this repository's Ollama examples
+and integration tests.
 
 #### 1. Install Ollama
 
@@ -498,49 +483,17 @@ VRAM requirements for `gemma4:31b` by quantization:
 curl -fsSL https://ollama.com/install.sh | sh
 ```
 
-#### 2. Pull a vision model
+#### 2. Pull the cloud-routed model
 
 ```bash
-# High quality (needs ~16 GB VRAM with Q4 quantization)
-ollama pull gemma4:31b
-
-# Lighter option (~6 GB VRAM)
-ollama pull llama3.2-vision
+ollama pull gemma4:31b-cloud
 ```
 
-#### 3a. Local Ollama (self-hosted)
-
-Create a `.env` file in the project root:
-
-```bash
-# .env — local Ollama with gemma4
-OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=gemma4:31b
-```
-
-Load it before starting the server:
-
-```bash
-conda activate marker-mcp
-bash start_mcp.sh          # sources .env automatically
-# or: set -a && source .env && set +a && marker_mcp --transport stdio
-```
-
-**Docker** — the container connects to the host Ollama instance:
-
-```bash
-OLLAMA_BASE_URL=http://host.docker.internal:11434 \
-OLLAMA_MODEL=gemma4:31b \
-docker compose up marker-mcp-gpu
-```
-
-> On Linux you may need to add `extra_hosts: ["host.docker.internal:host-gateway"]`
-> to the service in `docker-compose.yml`.
-
-#### 3b. Ollama Cloud (no local GPU required)
+#### 3. Configure Ollama Cloud
 
 Ollama Cloud routes inference to ollama.com servers — useful when local VRAM is
-insufficient to run `gemma4:31b`. Requires an [ollama.com](https://ollama.com) account.
+insufficient to run large local multimodal models. Requires an
+[ollama.com](https://ollama.com) account.
 
 ```bash
 # Sign in once
@@ -556,12 +509,18 @@ Configure the server to use the cloud model:
 # .env — Ollama Cloud
 OLLAMA_BASE_URL=http://localhost:11434   # still routes through local Ollama daemon
 OLLAMA_MODEL=gemma4:31b-cloud
+OLLAMA_BATCH_SIZE=3
+OLLAMA_BATCH_WAIT_MS=50
 ```
 
 > **Privacy note:** With Ollama Cloud, document content is sent to ollama.com servers.
 > Use local Ollama when working with sensitive documents.
 > 
 > To disable cloud routing entirely: `export OLLAMA_NO_CLOUD=1`
+>
+> `marker-mcp` now micro-batches compatible Ollama LLM calls inside the service layer,
+> so repeated equation/form/markdown-style fixes can be combined into fewer model calls
+> without changing the local GPU OCR/layout pipeline.
 
 #### 4. Use the tool
 
@@ -606,7 +565,7 @@ OPENAI_MODEL=your-model-name
 > ```bash
 > OPENAI_API_KEY=ollama
 > OPENAI_BASE_URL=http://localhost:11434/v1
-> OPENAI_MODEL=llama3.2-vision
+> OPENAI_MODEL=gemma4:31b-cloud
 > ```
 
 ---
@@ -629,7 +588,7 @@ If you need to override the auto-detection (e.g., multiple keys are set):
 # .env
 MARKER_LLM_SERVICE=marker.services.ollama.OllamaService
 OLLAMA_BASE_URL=http://localhost:11434
-OLLAMA_MODEL=llava
+OLLAMA_MODEL=gemma4:31b-cloud
 ```
 
 Available service paths:

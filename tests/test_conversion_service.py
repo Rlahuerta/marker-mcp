@@ -465,6 +465,11 @@ class TestChunkHelpers:
             (608, 900),
         ]
 
+    def test_page_tile_overlap_scales_down_for_small_tiles(self):
+        assert svc._page_tile_overlap_px(250) == 41
+        assert svc._page_tile_overlap_px(400) == 66
+        assert svc._page_tile_overlap_px(1600) == 96
+
     def test_parse_and_chunk_explicit_page_range(self):
         assert svc._parse_page_range("0,2,4-6") == [0, 2, 4, 5, 6]
         assert svc._chunk_requested_page_range("0,2,4-6", max_pages_per_chunk=2) == [
@@ -481,6 +486,43 @@ class TestChunkHelpers:
                 "Continuation\nFinal line",
             ]
         ) == "# Page 1\nShared line\n\nContinuation\n\nFinal line"
+
+    def test_merge_tiled_texts_strips_per_tile_page_separators(self):
+        assert svc._merge_tiled_texts(
+            [
+                "{0}------------------------------------------------\n\n# Page 1\nShared line",
+                "{0}------------------------------------------------\n\nShared line\nContinuation",
+            ]
+        ) == "# Page 1\nShared line\n\nContinuation"
+
+    def test_cleanup_tiled_page_text_prefers_fuller_overlap_block(self):
+        assert svc._cleanup_tiled_page_text(
+            "\n\n".join(
+                [
+                    "# Abstract",
+                    "Any claim of precise risk carries a margin of error.",
+                    (
+                        "Any claim of precise risk carries a margin of error, and that margin "
+                        "itself is uncertain in an infinite regress of doubt."
+                    ),
+                ]
+            )
+        ) == (
+            "# Abstract\n\n"
+            "Any claim of precise risk carries a margin of error, and that margin itself is "
+            "uncertain in an infinite regress of doubt."
+        )
+
+    def test_cleanup_tiled_page_text_drops_repeated_phrase_gibberish(self):
+        assert svc._cleanup_tiled_page_text(
+            "\n\n".join(
+                [
+                    "# Intro",
+                    "the contract of the contract of the contract of the contract of the contract",
+                    "A clean paragraph remains.",
+                ]
+            )
+        ) == "# Intro\n\nA clean paragraph remains."
 
     def test_merge_chunk_texts_preserves_chunk_order(self):
         assert svc._merge_chunk_texts(["# Chunk 1", "# Chunk 2", "# Chunk 3"]) == (
@@ -813,6 +855,41 @@ class TestPageTilingOrchestration:
 
         assert result["metadata"]["page_count"] == 1
         assert mock_release.call_count == 4
+
+    async def test_convert_file_with_page_tiling_reinserts_page_separators_once_per_page(self, tmp_pdf_file):
+        tile_options: list[dict] = []
+        tile_index = 0
+
+        async def fake_run(filepath, options, sync_converter, warnings_list=None, allow_cpu_fallback=True):
+            nonlocal tile_index
+            tile_options.append(dict(options))
+            tile_index += 1
+            return {
+                "text": "{0}------------------------------------------------\n\n# Tile "
+                f"{tile_index}",
+                "metadata": {},
+                "warnings": [],
+                "assets": {},
+            }
+
+        with (
+            patch(
+                "marker_mcp.conversion_service._render_pdf_page_image",
+                side_effect=lambda *args, **kwargs: Image.new("RGB", (400, 300), color="white"),
+            ),
+            patch("marker_mcp.conversion_service._run_conversion_with_fallbacks", side_effect=fake_run),
+        ):
+            result = await svc._convert_file_with_page_tiling(
+                str(tmp_pdf_file),
+                {"page_range": "0-1", "max_page_height_px": 400, "paginate_output": True},
+                svc._convert_sync_result,
+            )
+
+        assert all("paginate_output" not in opts for opts in tile_options)
+        assert result["text"] == (
+            "{0}------------------------------------------------\n\n# Tile 1\n\n"
+            "{1}------------------------------------------------\n\n# Tile 2"
+        )
 
 
 class TestStructuredFigureExport:

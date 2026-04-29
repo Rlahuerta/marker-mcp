@@ -47,11 +47,11 @@ class TestBuildOptions:
 
     def test_use_llm_injects_ollama_config(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b")
+        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b-cloud")
         opts = _build_options("markdown", None, False, False, True)
         assert opts["use_llm"] is True
-        assert opts["llm_service"] == "marker.services.ollama.OllamaService"
-        assert opts["ollama_model"] == "gemma4:31b"
+        assert opts["llm_service"] == "marker_mcp.ollama_service.OllamaService"
+        assert opts["ollama_model"] == "gemma4:31b-cloud"
 
     def test_use_llm_false_no_llm_keys(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")

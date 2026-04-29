@@ -31,30 +31,38 @@ class TestOllamaDetection:
     def test_ollama_base_url_only(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
         result = _llm_options_from_env()
-        assert result["llm_service"] == "marker.services.ollama.OllamaService"
+        assert result["llm_service"] == "marker_mcp.ollama_service.OllamaService"
         assert result["ollama_base_url"] == "http://localhost:11434"
         assert "ollama_model" not in result
 
     def test_ollama_model_only(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b-cloud")
         result = _llm_options_from_env()
-        assert result["llm_service"] == "marker.services.ollama.OllamaService"
+        assert result["llm_service"] == "marker_mcp.ollama_service.OllamaService"
         assert result["ollama_model"] == "gemma4:31b-cloud"
         assert "ollama_base_url" not in result
 
     def test_ollama_both_vars(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
-        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b")
+        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b-cloud")
         result = _llm_options_from_env()
-        assert result["llm_service"] == "marker.services.ollama.OllamaService"
+        assert result["llm_service"] == "marker_mcp.ollama_service.OllamaService"
         assert result["ollama_base_url"] == "http://localhost:11434"
-        assert result["ollama_model"] == "gemma4:31b"
+        assert result["ollama_model"] == "gemma4:31b-cloud"
+
+    def test_ollama_batch_env_vars(self, clean_llm_env, monkeypatch):
+        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b-cloud")
+        monkeypatch.setenv("OLLAMA_BATCH_SIZE", "6")
+        monkeypatch.setenv("OLLAMA_BATCH_WAIT_MS", "120")
+        result = _llm_options_from_env()
+        assert result["ollama_batch_size"] == 6
+        assert result["ollama_batch_wait_ms"] == 120
 
     def test_ollama_beats_openai_when_both_set(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OLLAMA_BASE_URL", "http://localhost:11434")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         result = _llm_options_from_env()
-        assert result["llm_service"] == "marker.services.ollama.OllamaService"
+        assert result["llm_service"] == "marker_mcp.ollama_service.OllamaService"
         # OpenAI key is still passed through (for potential use)
         assert result.get("openai_api_key") == "sk-test"
 
@@ -116,11 +124,11 @@ class TestServicePriority:
         assert result["llm_service"] == "custom.MyService"
 
     def test_ollama_beats_openai_and_claude(self, clean_llm_env, monkeypatch):
-        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b")
+        monkeypatch.setenv("OLLAMA_MODEL", "gemma4:31b-cloud")
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
         monkeypatch.setenv("CLAUDE_API_KEY", "sk-ant")
         result = _llm_options_from_env()
-        assert result["llm_service"] == "marker.services.ollama.OllamaService"
+        assert result["llm_service"] == "marker_mcp.ollama_service.OllamaService"
 
     def test_openai_beats_claude(self, clean_llm_env, monkeypatch):
         monkeypatch.setenv("OPENAI_API_KEY", "sk-test")
